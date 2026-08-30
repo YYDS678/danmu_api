@@ -2,7 +2,6 @@ name: Fork Sync
 
 permissions:
     contents: write
-    workflows: write  # 上游提交包含 workflow 文件变更时，推送需要此权限
 
 on:
     schedule:
