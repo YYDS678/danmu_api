@@ -19,26 +19,50 @@ jobs:
               uses: actions/checkout@v4
               with:
                 token: ${{ secrets.GITHUB_TOKEN }}
+                fetch-depth: 0  # 完整历史，merge 时才能正确计算共同祖先
 
+            # 手动 merge 上游，并在推送前剥离所有 workflow 相关变更：
+            # 1) GITHUB_TOKEN 无权推送 workflow 文件的创建/修改/删除，带了必被拒
+            # 2) 本 fork 只保留 sync_fork.yml 与 build-for-uzn.yml，上游的其余
+            #    workflow（docker、hf、pr_agent 等）一律不随同步带入
             - name: Sync Upstream
-              uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
-              with:
-                  target_repo_token: ${{ secrets.GITHUB_TOKEN }}
-                  upstream_sync_repo: huangxd-/danmu_api
-                  upstream_sync_branch: main
-                  target_sync_branch: main
-                  test_mode: false
+              run: |
+                set -euo pipefail
+                git config user.name "GH Action - Upstream Sync"
+                git config user.email "action@github.com"
+                git remote add upstream https://github.com/huangxd-/danmu_api.git
+                git fetch upstream main
 
-            - name: Check for new commits
-              if: success()
-              run: echo "Sync completed successfully"
+                if git merge-base --is-ancestor upstream/main HEAD; then
+                    echo "No new upstream commits, nothing to sync."
+                    exit 0
+                fi
+
+                # 若冲突发生在 .github/workflows / .pr_agent.toml 之外，说明
+                # 两边对同一文件都有改动，需要人工介入，commit 会失败并报错
+                git merge upstream/main --no-edit || true
+
+                # 将 workflow 相关路径重置为同步前（merge 前的 HEAD，即 ORIG_HEAD）的状态
+                git rm -rqf --ignore-unmatch .github/workflows
+                git checkout ORIG_HEAD -- .github/workflows
+                git rm -qf --ignore-unmatch .pr_agent.toml
+                if git cat-file -e ORIG_HEAD:.pr_agent.toml 2>/dev/null; then
+                    git checkout ORIG_HEAD -- .pr_agent.toml
+                fi
+
+                if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+                    git commit --no-edit  # 冲突 merge 已在上方解决，完成提交
+                elif ! git diff --quiet HEAD -- .github/workflows .pr_agent.toml; then
+                    git commit --amend --no-edit  # 干净 merge 后把剥离动作并入 merge 提交
+                fi
+
+                git push origin main
 
             - name: Check for Failure
               if: failure()
               run: |
                   echo "[Error] Sync failed. This might be due to:"
-                  echo "1. Changes in the upstream workflow file"
-                  echo "2. Merge conflicts that need manual resolution"
-                  echo "3. Network issues"
+                  echo "1. Merge conflicts that need manual resolution"
+                  echo "2. Network issues"
                   echo "Please check the logs and consider manual sync if needed."
                   exit 1
