@@ -1,0 +1,34 @@
+[config]
+response_language = "zh-CN"                   # 输出用中文回复
+
+# 忽略自动化产生的 PR（如 renovate / auto-merge）
+ignore_pr_title = ["^\\[Auto\\]", "^Auto"]
+ignore_pr_labels = ["dependencies", "skip-review"]
+ignore_pr_authors = ["dependabot[bot]"]
+
+[pr_reviewer]
+extra_instructions = """\
+在代码反馈部分重点关注以下几点:
+- 正确性、安全性、必要性、稳定性、后期易维护性
+- 是否处理了合理的边界条件和异常输入
+- 是否存在明显的安全漏洞
+- 是否破坏已有功能
+- 环境变量增加是否有必要、是否可以合并到已有环境变量
+- 新增文件是否有必要、是否可以合并到已有文件
+- 并发/竞态条件是否被正确处理
+- 是否存在明显的性能瓶颈
+- 对应的README内容是否增删改
+用中文回复。
+"""
+num_code_suggestions = 4
+inline_code_comments = true
+require_score_review = false
+require_tests_review = false
+
+[pr_description]
+publish_labels = false
+add_original_user_description = true
+
+[pr_code_suggestions]
+num_code_suggestions = 4
+extra_instructions = "优先给出可以直接采纳的具体代码修改"
