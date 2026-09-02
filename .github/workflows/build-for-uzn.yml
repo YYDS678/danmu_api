@@ -45,7 +45,21 @@ jobs:
 
             - 构建提交: ${{ github.sha }}
 
-            可通过 `danmu_api_server.cjs.md5`（产物内容的 md5）判断是否有新版本。
+            ## 使用说明（UZN 网络订阅源）
+
+            1. 复制下方订阅链接
+            2. 打开弹幕服务页，选择「本地服务」
+            3. 选择「网络订阅源」
+            4. 粘贴订阅链接并保存即可
+
+            ```
+            https://github.com/${{ github.repository }}/releases/download/latest/danmu_api_server.cjs.md5
+            ```
+
+            ## 文件说明
+
+            - [`danmu_api_server.cjs`](https://github.com/${{ github.repository }}/releases/download/latest/danmu_api_server.cjs)：服务端主程序
+            - [`danmu_api_server.cjs.md5`](https://github.com/${{ github.repository }}/releases/download/latest/danmu_api_server.cjs.md5)：主程序内容的 md5，订阅源通过比对 md5 判断是否有新版本并自动更新
           files: |
             dist/danmu_api_server.cjs
             dist/danmu_api_server.cjs.md5
