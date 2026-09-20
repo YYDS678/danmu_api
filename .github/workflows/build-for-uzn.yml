@@ -2,10 +2,15 @@ name: Build danmu-api for UZN
 
 # 为 UZN app 构建打包产物并发布到固定的 latest Release
 # push 到 main 即自动构建，产物覆盖更新到同一个 Release（下载链接不变）；也可手动触发
+# 注意：Fork Sync 用 GITHUB_TOKEN 推送的 commit 不会触发 push 事件（GitHub 安全机制），
+# 因此 Fork Sync 同步成功后会发 repository_dispatch 来触发本 workflow
 on:
   push:
     branches:
       - main
+  repository_dispatch:
+    types:
+      - upstream-synced
   workflow_dispatch:
 
 permissions:

@@ -26,6 +26,7 @@ jobs:
             # 2) 本 fork 只保留 sync_fork.yml 与 build-for-uzn.yml，上游的其余
             #    workflow（docker、hf、pr_agent 等）一律不随同步带入
             - name: Sync Upstream
+              id: sync
               run: |
                 set -euo pipefail
                 git config user.name "GH Action - Upstream Sync"
@@ -57,6 +58,17 @@ jobs:
                 fi
 
                 git push origin main
+                # GITHUB_TOKEN 推送不会触发 push 事件 workflow（GitHub 安全机制），
+                # 需在这里显式通知 UZN 打包 workflow 重新构建
+                echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+            - name: Trigger UZN build
+              if: steps.sync.outputs.pushed == 'true'
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  gh api repos/${{ github.repository }}/dispatches -f event_type=upstream-synced
+                  echo "已通知 Build danmu-api for UZN 重新打包"
 
             - name: Check for Failure
               if: failure()
