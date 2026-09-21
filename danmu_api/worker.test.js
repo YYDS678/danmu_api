@@ -9,10 +9,12 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
+import { spawnSync } from 'node:child_process';
 import { Request as NodeFetchRequest } from 'node-fetch';
 import { handleRequest } from './worker.js';
-import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, buildSearchAnimeUrl } from "./apis/dandan-api.js";
+import { extractTitleSeasonEpisode, getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, buildSearchAnimeUrl, matchSeason, matchAniAndEp, fallbackMatchAniAndEp } from "./apis/dandan-api.js";
 import { stripLinkOffset, applyOffset } from "./utils/offset-util.js";
+import { extractSeasonNumberFromAnimeTitle, normalizeTitleForMatch } from "./utils/common-util.js";
 import { handleFavoriteRefresh } from './apis/favorite-api.js';
 import { handleClearCache } from './apis/system-api.js';
 import { getRedisCaches, getRedisKey, pingRedis, setRedisKey, setRedisKeyWithExpiry, updateRedisCaches } from "./utils/redis-util.js";
@@ -40,6 +42,7 @@ import { addFavorite, listFavorites, loadFavorites, removeFavorite, resolveFavor
 import { candidateMatchesMappingQualifiers, candidateMatchesMappingTitle, parseAutoMatchMappingRules, resolveAutoMatchMapping } from './utils/auto-match-mapping-util.js';
 import { HTML_TEMPLATE } from './ui/template.js';
 import { apitestJsContent } from './ui/js/apitest.js';
+import { logviewJsContent } from './ui/js/logview.js';
 import { systemSettingsJsContent } from './ui/js/systemsettings.js';
 import { previewJsContent } from './ui/js/preview.js';
 import { convertToAsciiSum } from "./utils/codec-util.js";
@@ -51,7 +54,7 @@ import { extractFongmiSeasonNumber, scoreFongmiEpisodeMatch } from "./apis/clien
 import { localDanmuJsContent } from './ui/js/localdanmu.js';
 import { buildLocalDanmuResourceKey, groupLocalDanmuResources, parseLocalDanmu, normalizeLocalSeason } from './utils/local-danmu-parser.js';
 import { handleLocalDanmuUpload, handleLocalDanmuList, handleLocalDanmuDelete, handleLocalDanmuGet, handleLocalDanmuUpdate } from './apis/local-danmu-api.js';
-import { saveLocalDanmu, getLocalDanmu, findLocalDanmu } from './utils/local-danmu-store.js';
+import { saveLocalDanmu, getLocalDanmu, listLocalDanmu, findLocalDanmu, removeLocalDanmu, localDanmuFileName } from './utils/local-danmu-store.js';
 import { handleConfig } from './apis/system-api.js';
 
 async function readRequestBody(req) {
@@ -2992,6 +2995,120 @@ test('worker.js API endpoints', async (t) => {
 
 });
 
+test('season matching unifies traditional and simplified titles', () => {
+  const queryTitle = '无职转生 ～到了异世界就拿出真本事～';
+
+  // 繁体别名与简体查询词指向同一作品同一季时必须命中；季号不一致则不得命中
+  assert.equal(matchSeason({ animeTitle: '無職轉生～到了異世界就拿出真本事～第三季', source: 'dandan' }, queryTitle, 3), true);
+  assert.equal(matchSeason({ animeTitle: '無職轉生～到了異世界就拿出真本事～第3季', source: 'dandan' }, queryTitle, 3), true);
+  assert.equal(matchSeason({ animeTitle: '無職轉生～到了異世界就拿出真本事～第三季', source: 'dandan' }, queryTitle, 2), false);
+
+  // 季号标识插在主体名称中间时查询词不是标题前缀，不得命中
+  assert.equal(matchSeason({ animeTitle: '无职转生Ⅲ ～到了异世界就拿出真本事～', source: 'dandan' }, queryTitle, 3), false);
+  assert.equal(matchSeason({ animeTitle: '无职转生 第三季 ～到了异世界就拿出真本事～', source: 'dandan' }, queryTitle, 3), false);
+
+  // 主体一致但无季号：仅第 1 季命中；有其它季号则不得命中
+  assert.equal(matchSeason({ animeTitle: '無職轉生～到了異世界就拿出真本事～', source: 'dandan' }, queryTitle, 1), true);
+  assert.equal(matchSeason({ animeTitle: '無職轉生～到了異世界就拿出真本事～', source: 'dandan' }, queryTitle, 3), false);
+  assert.equal(matchSeason({ animeTitle: '無職轉生～到了異世界就拿出真本事 第二季', source: 'dandan' }, queryTitle, 3), false);
+
+  // 归一化不得把不同作品视为同一作品
+  assert.equal(normalizeTitleForMatch('无职英雄 技能什么的毫无用处').includes(normalizeTitleForMatch(queryTitle)), false);
+  assert.equal(matchSeason({ animeTitle: '无职英雄 技能什么的毫无用处(2025)', source: 'dandan' }, queryTitle, 3), false);
+});
+
+test('movie matching unifies traditional and simplified titles', async () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+
+  const buildMovie = (animeId, animeTitle) => ({
+    animeId,
+    bangumiId: String(animeId),
+    animeTitle,
+    aliases: [],
+    source: 'dandan',
+    startDate: '2020-01-01T00:00:00.000Z',
+    links: [{ id: animeId * 10 + 1, title: '【测试源】 正片', url: `test-${animeId}-1` }]
+  });
+
+  const traditional = buildMovie(3001, '某電影(2020)【电影】');
+  const withColon = buildMovie(3002, '某电影：终章(2020)【电影】');
+  const different = buildMovie(3003, '另一部电影(2020)【电影】');
+  const sequel = buildMovie(3004, '某电影2(2020)【电影】');
+  const detailStore = new Map([[3001, traditional], [3002, withColon], [3003, different], [3004, sequel]]);
+
+  const matchMovie = async (animes, title) => {
+    const result = await matchAniAndEp(null, null, null, { animes }, title, null, null, null, null, detailStore);
+    return result.resAnime ? result.resAnime.animeId : null;
+  };
+
+  // 繁简与全半角/冒号写法差异不影响电影标题相等判定
+  assert.equal(await matchMovie([traditional], '某电影'), 3001);
+  assert.equal(await matchMovie([withColon], '某电影: 终章'), 3002);
+
+  // 不同作品与续作编号仍视为不同作品
+  assert.equal(await matchMovie([different], '某电影'), null);
+  assert.equal(await matchMovie([sequel], '某电影'), null);
+});
+
+test('fallback matching prefers the candidate of the target season', async () => {
+  Globals.init({ LOG_LEVEL: 'error' });
+
+  const buildAnime = (animeId, animeTitle, aliases = []) => ({
+    animeId,
+    bangumiId: String(animeId),
+    animeTitle,
+    aliases,
+    source: 'dandan',
+    startDate: '2020-01-01T00:00:00.000Z',
+    links: Array.from({ length: 12 }, (_, i) => ({ id: animeId * 100 + i + 1, title: `【测试源】 第${i + 1}话`, url: `test-${animeId}-${i + 1}` }))
+  });
+
+  const secondSeason = buildAnime(2001, '某测试动画 第二季(2023)【TV动画】from dandan');
+  const thirdSeason = buildAnime(2002, '某测试动画 第三季(2026)【TV动画】from dandan');
+  const thirdSeasonByAlias = buildAnime(2003, '某测试动画(2026)【TV动画】from dandan', ['某测试动画 第三季']);
+  const detailStore = new Map([[2001, secondSeason], [2002, thirdSeason], [2003, thirdSeasonByAlias]]);
+
+  const matchFallback = async (animes, season) => {
+    const result = await fallbackMatchAniAndEp({ animes }, null, season, 12, null, '某测试动画', null, null, null, detailStore);
+    return result.resAnime ? result.resAnime.animeId : null;
+  };
+
+  // 目标季优先于候选列表顺序
+  assert.equal(await matchFallback([secondSeason, thirdSeason], 3), 2002);
+  assert.equal(await matchFallback([thirdSeason, secondSeason], 3), 2002);
+  assert.equal(await matchFallback([secondSeason, thirdSeason], 2), 2001);
+
+  // 季号仅出现在别名中时同样参与优先判断
+  assert.equal(await matchFallback([secondSeason, thirdSeasonByAlias], 3), 2003);
+
+  // 无同季候选或未指定季号时保持原有取值顺序
+  assert.equal(await matchFallback([secondSeason], 3), 2001);
+  assert.equal(await matchFallback([secondSeason, thirdSeason], null), 2001);
+});
+
+test('season extraction recognizes season markers', () => {
+  // 尾部阿拉伯数字、中文数字、S/Season/Part、罗马数字均识别为季号
+  assert.equal(extractSeasonNumberFromAnimeTitle('赛马娘2').season, 2);
+  assert.equal(extractSeasonNumberFromAnimeTitle('赛马娘 2').season, 2);
+  assert.equal(extractSeasonNumberFromAnimeTitle('孤独摇滚 12').season, 12);
+  assert.equal(extractSeasonNumberFromAnimeTitle('为美好的世界献上祝福3').season, 3);
+  assert.equal(extractSeasonNumberFromAnimeTitle('辉夜大小姐想让我告白 二').season, 2);
+  assert.equal(extractSeasonNumberFromAnimeTitle('咒术回战 S2').season, 2);
+  assert.equal(extractSeasonNumberFromAnimeTitle('咒术回战 Part 2').season, 2);
+  assert.equal(extractSeasonNumberFromAnimeTitle('无职转生 第三季').season, 3);
+  assert.equal(extractSeasonNumberFromAnimeTitle('無職転生Ⅲ ～異世界行ったら本気だす～').season, 3);
+  assert.equal(extractSeasonNumberFromAnimeTitle('无职转生Ⅲ ～到了异世界就拿出真本事～').season, 3);
+  assert.equal(extractSeasonNumberFromAnimeTitle('OVERLORD Ⅳ').season, 4);
+  assert.equal(extractSeasonNumberFromAnimeTitle('约会大作战Ⅴ').season, 5);
+
+  // 拉丁字母形式的罗马数字与英文缩写无法区分，不参与季号识别
+  assert.equal(extractSeasonNumberFromAnimeTitle('机动战士V高达').season, null);
+  assert.equal(extractSeasonNumberFromAnimeTitle('MAD MAX').season, null);
+
+  // 季号剥离后余下部分作为 baseTitle
+  assert.equal(extractSeasonNumberFromAnimeTitle('無職転生Ⅲ ～異世界行ったら本気だす～').baseTitle, '無職転生異世界行ったら本気だす');
+});
+
 // // 测试 Bangumi Data 数据下载时机（ensureBangumiDataReady）、配置变更触发下载（syncBangumiDataLifecycleOnConfigChange）
 // // 以及 getTMDBChineseTitle 漏写 await 的修复；与 envs RAW_ENV_KEYS 测试同为按需启用的内部测试
 // import { globals } from './configs/globals.js';
@@ -3231,6 +3348,137 @@ test('local XML reads the Bilibili color field instead of the font size', () => 
   ]);
 });
 
+const assFixture = (events, styles = '', wrapStyle = 2) => `[Script Info]
+ScriptType: v4.00+
+WrapStyle: ${wrapStyle}
+[V4+ Styles]
+Format: Name, PrimaryColour, Alignment
+${styles}
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+${events.map(text => `Dialogue: 0,0:00:01.18,0:00:06.18,Default,,0,0,0,,${text}`).join('\n')}`;
+const parseAssFixture = (...args) => parseLocalDanmu(Buffer.from(assFixture(...args)), 'test.ass');
+
+test('local ASS strips override tags while preserving literal text and commas', () => {
+  const ass = assFixture([String.raw`{\move(1280,0,-288,0)}滚动,弹幕`, String.raw`{\move(1280,329,-124,329)}<(ºOº)>`])
+    .replace('Dialogue: 0,0:00:01.18,0:00:06.18', 'Dialogue: 0,0:00:01.09,0:00:10.09');
+  const result = parseLocalDanmu(Buffer.from(ass), 'test.ass');
+  assert.deepEqual(result.comments, [
+    { p: '1.09,1,16777215', m: '滚动,弹幕' },
+    { p: '1.18,1,16777215', m: '<(ºOº)>' },
+  ]);
+  assert.deepEqual(result.errors, []);
+});
+
+test('local ASS maps primary colors and fixed alignment with movement taking precedence', () => {
+  const result = parseAssFixture([
+    String.raw`{\an8\pos(640,47)\c&H02F1FE&}顶部`,
+    String.raw`{\an2\1c&H000000&}黑色底部`,
+    String.raw`{\an8\move(1280,0,-100,0)}滚动`,
+    '样式继承',
+  ], 'Style: Default,&H320000FF,8');
+  assert.deepEqual(result.comments.map(x => x.p), [`1.18,5,${0xFEF102}`, '1.18,4,0', '1.18,1,16711680', '1.18,5,16711680']);
+});
+
+test('local ASS skips drawings and decodes line breaks and hard spaces', () => {
+  const result = parseAssFixture([
+    String.raw`{\p1}m 0 0 l 100 100{\p0}甲\h乙\n丙\N丁`,
+    String.raw`{\p1}m 0 0 l 10 10`,
+  ]);
+  assert.deepEqual(result.comments.map(x => x.m), ['甲\u00a0乙\n丙\n丁']);
+  assert.equal(parseAssFixture([String.raw`甲\n乙`], '', 0).comments[0].m, '甲 乙');
+  assert.equal(parseAssFixture([String.raw`{\q2}甲\n乙`], '', 0).comments[0].m, '甲\n乙');
+});
+
+test('local ASS uses first visible text color and supports style resets', () => {
+  const result = parseAssFixture([
+    String.raw`{\c&H0000FF&}红{\c&HFF0000&}蓝`,
+    String.raw`{\c&H0000FF&\r}默认`,
+    String.raw`{\rTop}顶部`,
+    String.raw`{\t(0,100,\clip(0,0,100,100)\c&H0000FF&)}默认`,
+    String.raw`{\c&H000000&\clip(0,0,100,100)}黑色`,
+  ], 'Style: Default,&H00FFFFFF,2\nStyle: Top,&H0000FF00,8');
+  assert.deepEqual(result.comments.map(x => x.p), ['1.18,4,16711680', '1.18,4,16777215', '1.18,4,65280', '1.18,4,16777215', '1.18,4,0']);
+});
+
+test('local ASS preserves escaped braces and unmatched literal braces', () => {
+  const result = parseAssFixture([
+    String.raw`文字\{括号\}与<(ºOº)>`,
+    String.raw`\{\an8\}字面标签`,
+    String.raw`{\an8}顶部\{文本\}`,
+    '文字{未闭合',
+  ]);
+  assert.deepEqual(result.comments.map(x => x.m), ['文字{括号}与<(ºOº)>', String.raw`{\an8}字面标签`, '顶部{文本}', '文字{未闭合']);
+});
+
+test('local ASS style resets preserve line alignment, wrapping and drawing mode', () => {
+  const result = parseAssFixture([
+    String.raw`{\an8\r}顶部`,
+    String.raw`{\p1\r}m 0 0 l 100 100{\p0}文字`,
+    String.raw`{\q2\r}甲\n乙`,
+    String.raw`{\an8}甲{\an2}乙`,
+  ], 'Style: Default,&H00FFFFFF,2', 0);
+  assert.equal(result.comments[0].p, '1.18,5,16777215');
+  assert.equal(result.comments[1].m, '文字');
+  assert.equal(result.comments[2].m, '甲\n乙');
+  assert.equal(result.comments[3].p, '1.18,5,16777215');
+});
+
+test('local ASS color resets use the currently selected style', () => {
+  const result = parseAssFixture([
+    String.raw`{\rGreen\c}绿色`,
+    String.raw`{\rGreen\c&H0000FF&\1c}绿色`,
+    String.raw`{\rGreen\r\c}白色`,
+  ], 'Style: Default,&H00FFFFFF,2\nStyle: Green,&H0000FF00,8');
+  assert.deepEqual(result.comments.map(x => x.p), ['1.18,4,65280', '1.18,4,65280', '1.18,4,16777215']);
+});
+
+test('local ASS literal markup remains text in the API JSON response viewer', () => {
+  const result = parseAssFixture(['<svg onload=alert(1)>', '<(ºOº)> &lt;b&gt; & "正文"']);
+  const context = vm.createContext({ window: {} });
+  vm.runInContext(logviewJsContent, context);
+  const html = context.highlightJSON(result);
+  // 唯一允许的 HTML 是高亮器自己生成的 span，弹幕标记必须被转义。
+  const encoded = html.replace(/<\/?span(?: class="[a-z]+")?>/g, '');
+  assert.doesNotMatch(encoded, /[<>]/);
+  const displayed = encoded.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+  assert.deepEqual(JSON.parse(displayed), result);
+});
+
+test('local ASS bounds work for unmatched braces and oversized Format declarations', () => {
+  // 放到有超时和堆上限的子进程，回归时不会阻塞测试进程或耗尽宿主内存。
+  const parserUrl = new URL('./utils/local-danmu-parser.js', import.meta.url).href;
+  const script = `
+    import assert from 'node:assert/strict';
+    import { parseLocalDanmu } from ${JSON.stringify(parserUrl)};
+    const text = '{'.repeat(320000);
+    const line = 'Dialogue: 0,0:00:01,0:00:02,Default,,0,0,0,,';
+    assert.equal(parseLocalDanmu(Buffer.from(line + text), 'test.ass').comments[0].m, text);
+    const format = Array.from({ length: 10000 }, (_, i) => 'unused' + i).join(',');
+    const oversized = ['[Events]', 'Format: ' + format + ',Start,Text', ...Array(500).fill('Dialogue: ,')].join(String.fromCharCode(10));
+    assert.throws(() => parseLocalDanmu(Buffer.from(oversized), 'test.ass'), /没有有效弹幕/);
+  `;
+  const result = spawnSync(process.execPath, ['--max-old-space-size=128', '--input-type=module', '-e', script], {
+    encoding: 'utf8', timeout: 5000,
+  });
+  assert.ifError(result.error);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('local ASS reads declared style fields and preserves SSA alignment compatibility', () => {
+  const ass = `[V4+ Styles]
+Format: Alignment, Name, PrimaryColour
+Style: 2,Default,&H00000000
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,黑色底部`;
+  assert.deepEqual(parseLocalDanmu(Buffer.from(ass), 'test.ass').comments, [{ p: '1.00,4,0', m: '黑色底部' }]);
+  const ssa = ass.replace('[V4+ Styles]', '[V4 Styles]').replace('Style: 2,Default,&H00000000', 'Style: 6,Default,255');
+  assert.equal(parseLocalDanmu(Buffer.from(ssa), 'test.ssa').comments[0].p, '1.00,5,16711680');
+  const bare = String.raw`Dialogue: 0,0:00:01.00,0:00:02.00,Default,,0,0,0,,{\a6}顶部`;
+  assert.equal(parseLocalDanmu(Buffer.from(bare), 'test.ssa').comments[0].p, '1.00,5,16777215');
+});
+
 const encodings = [
   ['UTF-8', text => Buffer.from(text, 'utf8')],
   ['UTF-8 with BOM', text => Buffer.concat([Buffer.from([0xEF, 0xBB, 0xBF]), Buffer.from(text, 'utf8')])],
@@ -3350,6 +3598,10 @@ function makeResource(title, episode, year = 2026, type = 'tv', status = 'ready'
     comments: [{ p: '1.00,1,16777215', m: `第${episode ?? 1}集弹幕` }],
   };
 }
+
+const localDanmuDir = () => path.join(process.cwd(), '.cache', 'local-danmu');
+const localIndexPath = () => path.join(localDanmuDir(), 'index.meta');
+const localDataPath = key => path.join(localDanmuDir(), localDanmuFileName(key));
 
 function searchUrl(keyword) {
   const url = new URL('http://localhost/api/v2/search/anime');
@@ -3614,6 +3866,10 @@ test('local source configuration and search', async t => {
     const groupEdit = await handleLocalDanmuUpdate(new Request('http://localhost/api/local-danmu/' + encodeURIComponent(firstResource.resourceKey), { method: 'PATCH', body: JSON.stringify({ scope: 'group', title: '编辑后的剧集', year: '2025', type: 'tv', season: '3' }), headers: { 'content-type': 'application/json' } }), firstResource.resourceKey);
     assert.equal(groupEdit.status, 200);
     assert.equal((await getLocalDanmu(firstResource.resourceKey)), null);
+    // 整组编辑会重写每条资源，弹幕内容必须原样保留（列表只提供元数据）。
+    const movedEpisode = await getLocalDanmu(buildLocalDanmuResourceKey({ title: '编辑后的剧集', year: 2025, type: 'tv', season: 3, episode: 1 }));
+    assert.equal(movedEpisode.comments.length, 1);
+    assert.equal(movedEpisode.comments[0].m, 'edit first');
     const movedList = await (await handleLocalDanmuList()).json();
     assert.deepEqual(movedList.resources.filter(resource => resource.title === '编辑后的剧集').map(resource => resource.season), [3, 3]);
     const conflictSource = await uploadResource({ title: '冲突剧集', year: 2026, type: 'tv', season: 1, episode: 1 }, 'conflict');
@@ -3622,6 +3878,207 @@ test('local source configuration and search', async t => {
     const conflict = await handleLocalDanmuUpdate(new Request('http://localhost/api/local-danmu/' + encodeURIComponent(conflictResource.resourceKey), { method: 'PATCH', body: JSON.stringify({ scope: 'resource', episode: 2, filename: '冲突文件.txt' }), headers: { 'content-type': 'application/json' } }), conflictResource.resourceKey);
     assert.equal(conflict.status, 409);
     assert.equal((await getLocalDanmu(conflictResource.resourceKey)).filename, 'danmu.json');
+  });
+
+  await t.test('local list uses a metadata-only index and rebuilds it when it is broken', async () => {
+    resetState();
+    const before = (await listLocalDanmu()).length;
+    await uploadResource({ title: '索引剧集', year: 2026, type: 'tv', season: 1, episode: 1 }, 'index one');
+    await uploadResource({ title: '索引剧集', year: 2026, type: 'tv', season: 1, episode: 2 }, 'index two');
+    const indexPath = path.join(process.cwd(), '.cache', 'local-danmu', 'index.meta');
+
+    const listed = await listLocalDanmu();
+    assert.equal(listed.length, before + 2);
+    assert.ok(listed.every(resource => !('comments' in resource)));
+    const onDisk = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+    assert.equal(onDisk.length, before + 2);
+    assert.ok(onDisk.every(resource => !('comments' in resource)));
+
+    // 索引丢了或坏了都要能自愈，不能因为缓存文件异常就看不到已导入的资源。
+    await fs.rm(indexPath);
+    assert.equal((await listLocalDanmu()).length, before + 2);
+    assert.equal(JSON.parse(await fs.readFile(indexPath, 'utf8')).length, before + 2);
+    await fs.writeFile(indexPath, 'not json', 'utf8');
+    assert.equal((await listLocalDanmu()).length, before + 2);
+    assert.equal(JSON.parse(await fs.readFile(indexPath, 'utf8')).length, before + 2);
+    // 索引必须是不可被当成资源的文件名：旧版本按 *.json 扫目录时不能把索引当成一集弹幕。
+    assert.ok(!indexPath.endsWith('.json'));
+  });
+
+  await t.test('a failed index write rolls the data file back', async () => {
+    resetState();
+    // 用同名目录占住索引路径，索引写入必定失败（rename 到目录会报错）。
+    const indexPath = path.join(process.cwd(), '.cache', 'local-danmu', 'index.meta');
+    await fs.rm(indexPath, { recursive: true, force: true });
+    await fs.mkdir(indexPath, { recursive: true });
+    const resourceKey = buildLocalDanmuResourceKey({ title: '回滚剧集', year: 2026, type: 'tv', season: 1, episode: 1 });
+    await assert.rejects(() => saveLocalDanmu({
+      resourceKey, videoId: 'rollback-1', title: '回滚剧集', year: 2026, type: 'tv', season: 1, episode: 1,
+      filename: 'danmu.json', size: 1, format: 'json', status: 'ready', count: 1, matchKeys: [], comments: [],
+      updatedAt: new Date().toISOString(),
+    }));
+    assert.equal(await getLocalDanmu(resourceKey), null);
+    await fs.rm(indexPath, { recursive: true, force: true });
+  });
+
+  await t.test('a failed index write keeps the previous version of an existing resource', async () => {
+    resetState();
+    const fields = { title: '覆盖回滚剧集', year: 2026, type: 'tv', season: 1, episode: 1 };
+    await uploadResource(fields, 'old comment');
+    const key = buildLocalDanmuResourceKey(fields);
+    const previous = await getLocalDanmu(key);
+    // 覆盖已有资源时索引写入失败：必须恢复旧文件，不能把上一次可用的弹幕删掉。
+    await fs.rm(localIndexPath(), { recursive: true, force: true });
+    await fs.mkdir(localIndexPath(), { recursive: true });
+    await assert.rejects(() => saveLocalDanmu({
+      ...previous,
+      comments: [{ p: '1,1,16777215', m: 'new comment' }],
+      count: 1,
+      updatedAt: new Date().toISOString(),
+    }));
+    const restored = await getLocalDanmu(key);
+    assert.equal(restored.comments.length, 1);
+    assert.equal(restored.comments[0].m, 'old comment');
+    await fs.rm(localIndexPath(), { recursive: true, force: true });
+  });
+
+  await t.test('a failed index update keeps the data file for deletion', async () => {
+    resetState();
+    const fields = { title: '删除回滚剧集', year: 2026, type: 'tv', season: 1, episode: 1 };
+    await uploadResource(fields, 'keep me');
+    const key = buildLocalDanmuResourceKey(fields);
+    // 删除先改索引再删数据：索引失败时文件必须还在，否则接口报错但资源已经丢了。
+    await fs.rm(localIndexPath(), { recursive: true, force: true });
+    await fs.mkdir(localIndexPath(), { recursive: true });
+    await assert.rejects(() => removeLocalDanmu(key));
+    const kept = await getLocalDanmu(key);
+    assert.equal(kept.comments[0].m, 'keep me');
+    await fs.rm(localIndexPath(), { recursive: true, force: true });
+  });
+
+  await t.test('list falls back to scanning when the index cannot be written', async () => {
+    resetState();
+    const fields = { title: '索引降级剧集', year: 2026, type: 'tv', season: 1, episode: 1 };
+    await uploadResource(fields, 'fallback comment');
+    const key = buildLocalDanmuResourceKey(fields);
+    await fs.rm(localIndexPath(), { recursive: true, force: true });
+    await fs.mkdir(localIndexPath(), { recursive: true });
+    const listed = await listLocalDanmu();
+    assert.ok(listed.some(resource => resource.resourceKey === key));
+    assert.ok(listed.every(resource => !('comments' in resource)));
+    await fs.rm(localIndexPath(), { recursive: true, force: true });
+  });
+
+  await t.test('list self-heals orphan and phantom entries by comparing the directory', async () => {
+    resetState();
+    const orphanFields = { title: '自愈孤儿剧集', year: 2026, type: 'tv', season: 1, episode: 1 };
+    const phantomFields = { title: '自愈幻影剧集', year: 2026, type: 'tv', season: 1, episode: 1 };
+    await uploadResource(orphanFields, 'orphan comment');
+    await uploadResource(phantomFields, 'phantom comment');
+    const orphanKey = buildLocalDanmuResourceKey(orphanFields);
+    const phantomKey = buildLocalDanmuResourceKey(phantomFields);
+    const indexPath = localIndexPath();
+    // 模拟数据已落盘但索引更新前进程退出：索引里没有，目录里有。
+    const index = JSON.parse(await fs.readFile(indexPath, 'utf8'));
+    await fs.writeFile(indexPath, JSON.stringify(index.filter(item => item.resourceKey !== orphanKey)), 'utf8');
+    const healed = await listLocalDanmu();
+    assert.ok(healed.some(resource => resource.resourceKey === orphanKey));
+    assert.ok(healed.some(resource => resource.resourceKey === phantomKey));
+    // 模拟索引里有但数据文件被外部删掉：列表要剔除幻影条目并修复索引。
+    await fs.unlink(localDataPath(phantomKey));
+    const cleaned = await listLocalDanmu();
+    assert.ok(cleaned.some(resource => resource.resourceKey === orphanKey));
+    assert.ok(!cleaned.some(resource => resource.resourceKey === phantomKey));
+    assert.ok(JSON.parse(await fs.readFile(indexPath, 'utf8')).every(item => item.resourceKey !== phantomKey));
+  });
+
+  await t.test('a concurrent upload during index rebuild is not lost', async t => {
+    resetState();
+    const baseFields = { title: '并发索引剧集', year: 2026, type: 'tv', season: 1, episode: 1 };
+    await uploadResource(baseFields, 'base comment');
+    const baseKey = buildLocalDanmuResourceKey(baseFields);
+    await fs.rm(localIndexPath(), { force: true }); // 索引缺失，接下来的列表会触发重建
+
+    const dirPath = localDanmuDir();
+    const realReaddir = fs.readdir.bind(fs);
+    const before = (await realReaddir(dirPath)).filter(name => name.endsWith('.json')).length;
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    let capturedResolve;
+    const captured = new Promise(resolve => { capturedResolve = resolve; });
+    let gated = false;
+    // 让列表先拿到旧目录快照并停住，再放上传进来，复现重建与上传交错的时序。
+    t.mock.method(fs, 'readdir', async (...args) => {
+      const names = await realReaddir(...args);
+      if (!gated) { gated = true; capturedResolve(); await gate; }
+      return names;
+    });
+
+    const listing = listLocalDanmu();
+    await captured;
+    const newFields = { ...baseFields, episode: 2 };
+    const upload = uploadResource(newFields, 'concurrent comment');
+    // 等新数据文件落盘；此时上传会卡在重建锁后面，索引还没更新。
+    for (let i = 0; i < 200; i++) {
+      const count = (await realReaddir(dirPath)).filter(name => name.endsWith('.json')).length;
+      if (count > before) break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    release();
+    const response = await upload;
+    assert.equal(response.status, 200);
+    await listing;
+
+    const newKey = buildLocalDanmuResourceKey(newFields);
+    const listed = await listLocalDanmu();
+    assert.ok(listed.some(resource => resource.resourceKey === baseKey));
+    assert.ok(listed.some(resource => resource.resourceKey === newKey));
+    const stored = await getLocalDanmu(newKey);
+    assert.equal(stored.comments[0].m, 'concurrent comment');
+    assert.ok(JSON.parse(await fs.readFile(localIndexPath(), 'utf8')).some(item => item.resourceKey === newKey));
+  });
+
+  await t.test('a concurrent upload during directory verification does not break listing', async t => {
+    resetState();
+    const baseFields = { title: '并发校验剧集', year: 2026, type: 'tv', season: 1, episode: 1 };
+    await uploadResource(baseFields, 'base comment'); // 上传刚写完索引，indexCache 为空
+
+    const dirPath = localDanmuDir();
+    const realReaddir = fs.readdir.bind(fs);
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    let capturedResolve;
+    const captured = new Promise(resolve => { capturedResolve = resolve; });
+    let gated = false;
+    t.mock.method(fs, 'readdir', async (...args) => {
+      const names = await realReaddir(...args);
+      if (!gated) { gated = true; capturedResolve(); await gate; }
+      return names;
+    });
+
+    const listing = listLocalDanmu();
+    await captured;
+    const newFields = { ...baseFields, episode: 2 };
+    await uploadResource(newFields, 'concurrent verify comment'); // 校验期间重写索引并清空缓存
+    release();
+    await listing; // 修复前这里会因为 indexCache 已被清空而抛 TypeError
+
+    const newKey = buildLocalDanmuResourceKey(newFields);
+    const listed = await listLocalDanmu();
+    assert.ok(listed.some(resource => resource.resourceKey === newKey));
+  });
+
+  await t.test('parallel uploads keep every entry in the index', async () => {
+    resetState();
+    const episodes = [1, 2, 3, 4, 5];
+    await Promise.all(episodes.map(episode => saveLocalDanmu({
+      resourceKey: buildLocalDanmuResourceKey({ title: '并发剧集', year: 2026, type: 'tv', season: 1, episode }),
+      videoId: `parallel-${episode}`, title: '并发剧集', year: 2026, type: 'tv', season: 1, episode,
+      filename: 'danmu.json', size: 1, format: 'json', status: 'ready', count: 1, matchKeys: [], comments: [],
+      updatedAt: new Date().toISOString(),
+    })));
+    const listed = await listLocalDanmu();
+    assert.equal(listed.filter(resource => resource.title === '并发剧集').length, episodes.length);
   });
 
   await t.test('search, details and matching isolate each season', async () => {
