@@ -10,7 +10,7 @@ import { handleFavoriteAdd, handleFavoriteList, handleFavoriteRefresh, handleFav
 import { getFongmiDanmaku } from "./apis/clients/fongmi-api.js";
 import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache, handleReqRecords, handleCacheAnimes } from "./apis/system-api.js";
 import { handleForwardTrace } from "./apis/forward-trace-api.js";
-import { handleSetEnv, handleAddEnv, handleDelEnv, handleAiVerify } from "./apis/env-api.js";
+import { handleSetEnv, handleAddEnv, handleDelEnv, handleAiVerify, handleDandanplayVerify } from "./apis/env-api.js";
 import { handleLocalDanmuUpload, handleLocalDanmuList, handleLocalDanmuGet, handleLocalDanmuDelete, handleLocalDanmuUpdate } from "./apis/local-danmu-api.js";
 import { extendBangumiDownloadLifecycle } from "./utils/bangumi-data-util.js";
 import { Segment } from "./models/dandan-model.js"
@@ -305,7 +305,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
     && !path.startsWith('/api/deploy') && !path.startsWith('/api/cache')
     && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')
     && !path.startsWith('/api/favorite')
-    && !path.startsWith('/api/ai') && !path.startsWith('/api/debug') && !path.startsWith('/api/local-danmu')) {
+    && !path.startsWith('/api/ai') && !path.startsWith('/api/nipaplay')
+    && !path.startsWith('/api/debug') && !path.startsWith('/api/local-danmu')) {
       log("info", `[system] [path check] Starting path normalization for: "${path}"`);
       const pathBeforeCleanup = path; // 保存清理前的路径检查是否修改
 
@@ -330,7 +331,8 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
         && !path.startsWith('/api/env') && !path.startsWith('/api/cache')
         && !path.startsWith('/api/cookie') && !path.startsWith('/api/config')
         && !path.startsWith('/api/favorite')
-        && !path.startsWith('/api/ai') && !path.startsWith('/api/debug') && !path.startsWith('/api/local-danmu')) {
+        && !path.startsWith('/api/ai') && !path.startsWith('/api/nipaplay')
+        && !path.startsWith('/api/debug') && !path.startsWith('/api/local-danmu')) {
           if (path.startsWith('/v2/') || path === '/v2') {
               log("info", `[system] [path check] Path is missing /api prefix. Adding /api...`);
               path = '/api' + path;
@@ -637,6 +639,11 @@ async function handleRequest(req, env, deployPlatform, clientIp) {
   // POST /api/ai/verify - 验证AI连通性
   if (path === "/api/ai/verify" && method === "POST") {
     return handleAiVerify(req);
+  }
+
+  // POST /api/nipaplay/verify - 验证弹弹play账号连通性
+  if (path === "/api/nipaplay/verify" && method === "POST") {
+    return handleDandanplayVerify(req);
   }
 
   return jsonResponse({ message: "Not found" }, 404);

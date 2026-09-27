@@ -924,6 +924,7 @@ function renderValueInput(item) {
         const currentKey = editingKeyName;
         const isBilibiliCookie = currentKey === 'BILIBILI_COOKIE';
         const isAiApiKey = currentKey === 'AI_API_KEY';
+        const isDandanplayPassword = currentKey === 'DANDANPLAY_PASSWORD';
         const isColorPool = currentKey === 'COLOR_POOL';
         const isDanmuOffset = currentKey === 'DANMU_OFFSET';
 		const isCustomMergeRules = currentKey === 'CUSTOM_MERGE_RULES';
@@ -1039,6 +1040,25 @@ function renderValueInput(item) {
                     </div>
                     <div class="ai-apikey-actions" style="margin-bottom: 15px;">
                         <button type="button" class="btn btn-primary btn-sm" id="ai-verify-btn" onclick="verifyAiConnection()">
+                            \${uiIcon('flask')} 测试连通性
+                        </button>
+                    </div>
+                </div>
+            \`;
+        } else if (isDandanplayPassword) {
+            // 弹弹play密码专用编辑界面
+            container.innerHTML = \`
+                <div class="dandanplay-editor">
+                    <label>弹弹play密码</label>
+                    <textarea class="form-group" id="text-value" placeholder="请输入弹弹play密码" rows="3">\${value}</textarea>
+                    <div class="form-help">账号在 DANDANPLAY_ACCOUNT 中配置，两者同时填写后 dandan 源经 NipaPlay 中转弹弹play服务端获取弹幕</div>
+
+                    <div class="dandanplay-status" id="dandanplay-status">
+                        <span class="dandanplay-status-icon">\${uiIcon('search')}</span>
+                        <span class="dandanplay-status-text">点击下方按钮测试连通性</span>
+                    </div>
+                    <div class="dandanplay-actions" style="margin-bottom: 15px;">
+                        <button type="button" class="btn btn-primary btn-sm" id="dandanplay-verify-btn" onclick="verifyDandanplayConnection()">
                             \${uiIcon('flask')} 测试连通性
                         </button>
                     </div>
@@ -2626,8 +2646,17 @@ document.getElementById('env-form').addEventListener('submit', async function(e)
         itemData = { key, value, description, type };
     }
 
+    // 掩码值（预览星号）表示凭据未改动，跳过写入以免用星号覆盖服务端已存真实值
+    const isMasked = /^[*]+$/.test(value);
+
     // 调用API更新环境变量 - 先尝试set接口，失败则调用add接口
     try {
+        if (isMasked) {
+            // 凭据值未变更，保留服务端已存值，仅关闭编辑框
+            addLog(\`配置项 \${key} 未变更，已保留原值\`, 'info');
+            closeModal();
+            return;
+        }
         // 首先尝试使用set接口更新
         let response = await fetch(buildApiUrl('/api/env/set'), {
             method: 'POST',
@@ -2965,6 +2994,22 @@ function showBilibiliCookieSaveHint(text) {
 }
 
 /* ========================================
+   连通性测试取值
+   ======================================== */
+
+// 读取配置列表中某项的当前值，供连通性测试随请求提交；掩码（当前访问无权限读取明文）返回空串，由服务端回退到已保存配置
+function readLocalEnvValue(key) {
+    for (const items of Object.values(envVariables)) {
+        const item = items.find(entry => entry.key === key);
+        if (item && typeof item.value === 'string') {
+            const value = item.value.trim();
+            return /^[*]+$/.test(value) ? '' : value;
+        }
+    }
+    return '';
+}
+
+/* ========================================
    AI API Key 连通性测试功能
    ======================================== */
 async function verifyAiConnection() {
@@ -2989,14 +3034,19 @@ async function verifyAiConnection() {
     
     statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('search')}</span><span class="ai-status-text">正在测试连通性...</span>\`;
     
-    // 检查是否为脱敏后的 *...* 
+    // 地址与模型始终随请求提交，避免云部署下因未重新部署而取不到新配置；密钥为脱敏值时省略该字段，由服务端使用已保存的密钥
     const isMasked = /^[*]+$/.test(apiKey);
+    const payload = {
+        aiBaseUrl: readLocalEnvValue('AI_BASE_URL'),
+        aiModel: readLocalEnvValue('AI_MODEL')
+    };
+    if (!isMasked) payload.aiApiKey = apiKey;
     
     try {
         const response = await fetch(buildApiUrl('/api/ai/verify', true), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(isMasked ? {} : { 'aiApiKey': apiKey })
+            body: JSON.stringify(payload)
         });
         
         const result = await response.json();
@@ -3010,6 +3060,62 @@ async function verifyAiConnection() {
         }
     } catch (error) {
         statusEl.innerHTML = \`<span class="ai-status-icon">\${uiIcon('alert-triangle')}</span><span class="ai-status-text">测试请求失败: \${error.message}</span>\`;
+        statusEl.style.color = 'var(--warning-color, #ffc107)';
+    } finally {
+        // 恢复按钮状态
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+}
+
+/* ========================================
+   弹弹play密码连通性测试功能
+   ======================================== */
+async function verifyDandanplayConnection() {
+    const statusEl = document.getElementById('dandanplay-status');
+    const btn = document.getElementById('dandanplay-verify-btn');
+    const passwordInput = document.getElementById('text-value');
+
+    if (!statusEl || !passwordInput) return;
+
+    const password = passwordInput.value.trim();
+
+    // 如果输入框为空，提示未配置
+    if (!password) {
+        statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('alert-triangle')}</span><span class="dandanplay-status-text">请先输入弹弹play密码</span>\`;
+        return;
+    }
+
+    // 设置按钮为加载状态
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<span class="loading-spinner-small"></span>';
+    btn.disabled = true;
+
+    statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('search')}</span><span class="dandanplay-status-text">正在测试连通性...</span>\`;
+
+    // 账号始终随请求提交，避免云部署下因未重新部署而取不到新账号；密码为脱敏值时省略该字段，由服务端使用已保存的密码
+    const isMasked = /^[*]+$/.test(password);
+    const payload = { dandanplayAccount: readLocalEnvValue('DANDANPLAY_ACCOUNT') };
+    if (!isMasked) payload.dandanplayPassword = password;
+
+    try {
+        const response = await fetch(buildApiUrl('/api/nipaplay/verify', true), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const result = await response.json();
+
+        if (result.ok) {
+            statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('check-circle')}</span><span class="dandanplay-status-text">\${result.message || '弹弹play账号连通性测试成功'}</span>\`;
+            statusEl.style.color = 'var(--success-color, #28a745)';
+        } else {
+            statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('x-circle')}</span><span class="dandanplay-status-text">\${result.message || '连通性测试失败'}</span>\`;
+            statusEl.style.color = 'var(--danger-color, #dc3545)';
+        }
+    } catch (error) {
+        statusEl.innerHTML = \`<span class="dandanplay-status-icon">\${uiIcon('alert-triangle')}</span><span class="dandanplay-status-text">测试请求失败: \${error.message}</span>\`;
         statusEl.style.color = 'var(--warning-color, #ffc107)';
     } finally {
         // 恢复按钮状态

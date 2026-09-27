@@ -513,7 +513,8 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 | AI_API_KEY      | 【可选】AI服务的API密钥，用于身份验证，默认为空，需手动填写       |
 | AI_MATCH_PROMPT      | 【可选】AI匹配提示词，用于自定义AI匹配行为，不填提供默认提示词，提示词如下       |
 | USE_BANGUMI_DATA      | 【可选】[Bangumi Data](https://github.com/bangumi-data/bangumi-data) 加速匹配开关，默认值：`false`（关闭），开启后将动画元数据缓存至本地或内存中给源调用，提升动画源的检索与匹配速度并解锁隐藏/区域番剧（本地和Docker部署使用时请先挂载.cache目录获得最佳体验，云部署使用时会将数据缓存至临时内存中如果体验不佳请关闭）       |
-| NIPAPLAY_REPLACE_DANDAN      | 【可选】 [NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) 弹弹302关联弹幕替代开关（用于 dandan 源），默认为`false`（关闭，使用弹弹原生弹幕），可选值：`true`、`false`。开启后 dandan 源以 nipaplay 弹弹302关联弹幕替代弹弹原生弹幕，因使用的是项目链路获取弹幕所以`1.会丢失弹弹平台弹幕` `2.无法获取下架视频` `3.如果关联中有巴哈姆特平台需要确保能够连通巴哈`       |
+| DANDANPLAY_ACCOUNT      | 【可选】弹弹play账号（dandan 源获取弹幕使用）。与密码同时填写后自动开启：[NipaPlay](https://github.com/AimesSoft/NipaPlay-Reload) 中转弹弹play服务端获取弹幕，并把同一请求下发的弹弹302关联链接分发给已接入的对应平台源实时拉取，最终弹幕为两者合并去重后的结果。注意：关联链接指向的平台视频若已下架将无法通过自有链路补取；关联含巴哈姆特平台时需确保能够连通巴哈       |
+| DANDANPLAY_PASSWORD      | 【可选】弹弹play密码（dandan 源获取弹幕使用），与账号同时填写后自动开启，UI 配置页提供连通性测试       |
 
 ```regex
 # EPISODE_TITLE_FILTER 默认值
@@ -737,7 +738,7 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 │       ├── local-danmu-store.js # 本地弹幕文件/Redis存储工具
 │       ├── merge-util.js       # 源合并处理工具
 │       ├── migu-util.js        # 咪咕工具
-│       ├── nipaplay-util.js    # NipaPlay 弹弹302关联链接工具
+│       ├── nipaplay-util.js    # NipaPlay 中转弹弹play服务端工具
 │       ├── offset-util.js      # 弹幕偏移工具
 │       ├── redis-util.js       # redis工具
 │       ├── server-listen-util.js # IPv4/IPv6 双栈监听与 IPv4 回退工具
@@ -812,7 +813,7 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 ### 特别感谢
 - 开源项目 [danmaku-anywhere](https://github.com/Mr-Quin/danmaku-anywhere) 提供的[弹弹play开放平台](https://doc.dandanplay.com/open/)接口
 
-- 开源项目 [NipaPlay-Reload](https://github.com/AimesSoft/NipaPlay-Reload) 提供的[弹弹play开放平台](https://doc.dandanplay.com/open/)302关联链接请求授权
+- 开源项目 [NipaPlay-Reload](https://github.com/AimesSoft/NipaPlay-Reload) 提供的[弹弹play开放平台](https://doc.dandanplay.com/open/) NipaPlay 中转服务端使用授权
 
 - 开源项目 [animeko](https://github.com/open-ani/animeko) 提供的弹幕API
 

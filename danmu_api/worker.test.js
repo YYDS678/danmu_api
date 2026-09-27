@@ -49,13 +49,16 @@ import { convertToAsciiSum } from "./utils/codec-util.js";
 import { convertToDanmakuJson, handleDanmusLike, splitBlockedWords, parseBlockedWord } from "./utils/danmu-util.js";
 import { Segment, SegmentListResponse } from "./models/dandan-model.js"
 import { initBangumiData, searchBangumiData, clearBangumiDataCache, dedupeBangumiSearchResults } from "./utils/bangumi-data-util.js";
-import { generateNipaplaySignature, parseNipaplayRelatedLinks, resolveNipaplayLink, applyShiftToDanmu } from "./utils/nipaplay-util.js";
+import { parseNipaplayRelatedLinks, resolveNipaplayLink, applyShiftToDanmu, fetchNipaplayDanmaku, verifyNipaplayAccount } from "./utils/nipaplay-util.js";
+import { httpPatch } from "./utils/http-util.js";
+import DandanSource from "./sources/dandan.js";
 import { extractFongmiSeasonNumber, scoreFongmiEpisodeMatch } from "./apis/clients/fongmi-api.js";
 import { localDanmuJsContent } from './ui/js/localdanmu.js';
 import { buildLocalDanmuResourceKey, groupLocalDanmuResources, parseLocalDanmu, normalizeLocalSeason } from './utils/local-danmu-parser.js';
 import { handleLocalDanmuUpload, handleLocalDanmuList, handleLocalDanmuDelete, handleLocalDanmuGet, handleLocalDanmuUpdate } from './apis/local-danmu-api.js';
 import { saveLocalDanmu, getLocalDanmu, listLocalDanmu, findLocalDanmu, removeLocalDanmu, localDanmuFileName } from './utils/local-danmu-store.js';
 import { handleConfig } from './apis/system-api.js';
+import { handleAiVerify, handleDandanplayVerify } from './apis/env-api.js';
 
 async function readRequestBody(req) {
   const chunks = [];
@@ -1058,6 +1061,87 @@ test('worker.js API endpoints', async (t) => {
       assert.doesNotThrow(() => new Function(systemSettingsJsContent));
       assert.doesNotThrow(() => new Function(previewJsContent));
       assert.match(previewJsContent, /AUTO_MATCH_MAPPING_TABLE/);
+      // 连通性测试以表单值随请求提交，避免云部署下未重新部署时取不到新配置
+      assert.match(systemSettingsJsContent, /function readLocalEnvValue\(key\)/);
+      assert.match(systemSettingsJsContent, /aiBaseUrl: readLocalEnvValue\('AI_BASE_URL'\)/);
+      assert.match(systemSettingsJsContent, /aiModel: readLocalEnvValue\('AI_MODEL'\)/);
+      assert.match(systemSettingsJsContent, /payload\.aiApiKey = apiKey/);
+      assert.match(systemSettingsJsContent, /dandanplayAccount: readLocalEnvValue\('DANDANPLAY_ACCOUNT'\)/);
+      assert.match(systemSettingsJsContent, /payload\.dandanplayPassword = password/);
+      assert.doesNotMatch(systemSettingsJsContent, /JSON\.stringify\(isMasked \? \{\} : \{ 'aiApiKey': apiKey \}\)/);
+      assert.doesNotMatch(systemSettingsJsContent, /JSON\.stringify\(isMasked \? \{\} : \{ 'dandanplayPassword': password \}\)/);
+    });
+
+    await t.test('弹弹play连通性验证使用请求体中的账号与密码', async () => {
+      const loginRequests = [];
+      const originalAccount = Globals.envs.dandanplayAccount;
+      const originalPassword = Globals.envs.dandanplayPassword;
+
+      try {
+        // 运行期配置与请求体不同，用于验证请求体优先
+        Globals.envs.dandanplayAccount = 'runtime@example.com';
+        Globals.envs.dandanplayPassword = 'runtime-password';
+
+        await withMockFetch(async (url, options) => {
+          loginRequests.push({ url: String(url), body: JSON.parse(options.body) });
+          return mockJsonResponse({
+            success: true,
+            token: 'mock-token',
+            tokenExpireTime: '2099-01-01T00:00:00Z',
+            screenName: '请求体账号'
+          });
+        }, async () => {
+          const response = await handleDandanplayVerify({
+            json: async () => ({ dandanplayAccount: 'body@example.com', dandanplayPassword: 'body-password' })
+          });
+          const body = await parseResponse(response);
+
+          assert.equal(body.ok, true);
+          assert.match(body.message, /请求体账号/);
+          assert.equal(loginRequests.length, 1);
+          assert.match(loginRequests[0].url, /\/api\/v2\/login$/);
+          assert.equal(loginRequests[0].body.userName, 'body@example.com');
+          assert.equal(loginRequests[0].body.password, 'body-password');
+        });
+      } finally {
+        Globals.envs.dandanplayAccount = originalAccount;
+        Globals.envs.dandanplayPassword = originalPassword;
+      }
+    });
+
+    await t.test('AI 连通性验证使用请求体中的密钥与地址模型', async () => {
+      const originalVerify = AIClient.prototype.verify;
+      const originalApiKey = Globals.envs.aiApiKey;
+      const originalBaseUrl = Globals.envs.aiBaseUrl;
+      const originalModel = Globals.envs.aiModel;
+      let captured = null;
+
+      AIClient.prototype.verify = async function () {
+        captured = { apiKey: this.apiKey, baseURL: this.baseURL, model: this.model };
+        return { ok: true };
+      };
+
+      try {
+        // 运行期配置与请求体不同，用于验证请求体优先
+        Globals.envs.aiApiKey = 'runtime-key';
+        Globals.envs.aiBaseUrl = 'https://runtime.example/v1';
+        Globals.envs.aiModel = 'runtime-model';
+
+        const response = await handleAiVerify({
+          json: async () => ({ aiApiKey: 'body-key', aiBaseUrl: 'https://body.example/v1', aiModel: 'body-model' })
+        });
+        const body = await parseResponse(response);
+
+        assert.equal(body.ok, true);
+        assert.equal(captured.apiKey, 'body-key');
+        assert.equal(captured.baseURL, 'https://body.example/v1');
+        assert.equal(captured.model, 'body-model');
+      } finally {
+        AIClient.prototype.verify = originalVerify;
+        Globals.envs.aiApiKey = originalApiKey;
+        Globals.envs.aiBaseUrl = originalBaseUrl;
+        Globals.envs.aiModel = originalModel;
+      }
     });
 
   await t.test('handleClearCache clears only the selected cache items', async t => {
@@ -3229,61 +3313,98 @@ test('season extraction recognizes season markers', () => {
 //     assert.strictEqual(Envs.get('DANMU_PUSH_URL', '', 'string'), 'http://h.com/cb#frag');
 //   });
 //
-//   await t.test('!encrypt 守卫：加密变量不走原始解析，防止绕过加密', () => {
+//   await t.test('加密变量保留 # 且仅以掩码写入预览集合', () => {
 //     reset();
 //     Envs.systemEnvBackup = {};
-//     Envs.rawEnvValues = { DANMU_PUSH_URL: 'http://x.com/cb#frag' };
-//     assert.strictEqual(Envs.get('DANMU_PUSH_URL', 'DEF', 'string', true), 'DEF');
+//     Envs.rawEnvValues = { DANDANPLAY_PASSWORD: 'p#w' };
+//     assert.strictEqual(Envs.get('DANDANPLAY_PASSWORD', 'DEF', 'string', true), 'p#w');
+//     assert.strictEqual(Envs.accessedEnvVars.get('DANDANPLAY_PASSWORD'), '***');
+//     assert.strictEqual(Envs.originalEnvVars.get('DANDANPLAY_PASSWORD'), 'p#w');
 //   });
 
-// test('nipaplay 弹弹302关联工具函数', async (t) => {
-//
-//   // generateNipaplaySignature：相同入参确定性产出，输出为 sha256 的 base64（44 字符）
-//   const sig1 = generateNipaplaySignature('app', '1700000000', '/api/v2/comment/1', 'secret');
-//   const sig2 = generateNipaplaySignature('app', '1700000000', '/api/v2/comment/1', 'secret');
-//   assert.strictEqual(sig1, sig2, '相同入参签名一致');
-//   assert.strictEqual(sig1.length, 44, 'sha256 base64 长度为 44');
-//   const sig3 = generateNipaplaySignature('app', '1700000001', '/api/v2/comment/1', 'secret');
-//   assert.notStrictEqual(sig1, sig3, 'timestamp 不同签名不同');
-//
-//   // parseNipaplayRelatedLinks：解析 urls（|）与 shift（,），按主机名映射到内部源并还原时间偏移
-//   const location = 'https://x.test/redirect?urls=https://www.bilibili.com/video/BV1xx|https://ani.gamer.com.tw/animeVideo.php?sn=12345&shift=0,30';
-//   const parsed = parseNipaplayRelatedLinks(location);
-//   assert.strictEqual(parsed.bilibili.length, 1, 'bilibili 链接被解析');
-//   assert.strictEqual(parsed.bilibili[0].url, 'https://www.bilibili.com/video/BV1xx', 'bilibili 仅保留 BV 主体');
-//   assert.strictEqual(parsed.bilibili[0].shift, 0, 'bilibili shift 为 0');
-//   assert.strictEqual(parsed.bahamut.length, 1, 'bahamut 链接被解析');
-//   assert.strictEqual(parsed.bahamut[0].url, 'https://ani.gamer.com.tw/animeVideo.php?sn=12345', 'bahamut 保留原始 URL');
-//   assert.strictEqual(parsed.bahamut[0].shift, 30, 'bahamut shift 为 30');
-//   assert.strictEqual(parsed.iqiyi.length, 0, '未提供平台为空');
-//   for (const k of ['bilibili', 'bahamut', 'iqiyi', 'youku', 'tencent', 'imgo']) {
-//     assert.deepStrictEqual(parseNipaplayRelatedLinks('')[k], [], `空字符串入参 ${k} 为空数组`);
-//     assert.deepStrictEqual(parseNipaplayRelatedLinks(null)[k], [], `空入参 ${k} 为空数组`);
-//   }
-//
-//   // resolveNipaplayLink：主机名到源路由，bahamut 提取 sn
-//   assert.deepStrictEqual(resolveNipaplayLink('https://ani.gamer.com.tw/animeVideo.php?sn=999'), { source: 'bahamut', realId: '999' });
-//   assert.deepStrictEqual(resolveNipaplayLink('https://v.qq.com/x/cover/abc.html'), { source: 'tencent', realId: 'https://v.qq.com/x/cover/abc.html' });
-//   assert.deepStrictEqual(resolveNipaplayLink('https://www.bilibili.com/video/BVxyz'), { source: 'bilibili', realId: 'https://www.bilibili.com/video/BVxyz' });
-//   assert.deepStrictEqual(resolveNipaplayLink('https://bilibili.com/video/BVxyz'), { source: 'bilibili', realId: 'https://bilibili.com/video/BVxyz' }, '无 www 前缀的裸域名同样归入 bilibili');
-//   assert.deepStrictEqual(resolveNipaplayLink('https://b23.tv/BVxyz'), { source: 'bilibili', realId: 'https://b23.tv/BVxyz' }, 'b站短链 b23.tv 经统一映射归入 bilibili');
-//   assert.deepStrictEqual(resolveNipaplayLink('https://unknown.example/x'), { source: null, realId: 'https://unknown.example/x' });
-//
-//   // parse 与 resolve 对 b23.tv 的识别保持一致：均归入 bilibili
-//   const b23Location = 'https://x.test/redirect?urls=https://b23.tv/BV1xx&shift=0';
-//   const b23Parsed = parseNipaplayRelatedLinks(b23Location);
-//   assert.strictEqual(b23Parsed.bilibili.length, 1, 'b23.tv 链接经 parse 归入 bilibili');
-//   assert.deepStrictEqual(resolveNipaplayLink(b23Parsed.bilibili[0].url), { source: 'bilibili', realId: b23Parsed.bilibili[0].url }, 'parse 与 resolve 对 b23.tv 的源识别一致');
-//
-//   // applyShiftToDanmu：校正时间偏移并标记实时拉取，不污染原对象
-//   const src = { p: '12.34,1,25,16777215,0', t: 12.34 };
-//   const shifted = applyShiftToDanmu(src, 5);
-//   assert.strictEqual(shifted.p, '17.34,1,25,16777215,0', 'p 时间字段加偏移');
-//   assert.strictEqual(shifted.t, 17.34, 't 加偏移');
-//   assert.strictEqual(shifted.isRealTimePulled, true, '标记为实时拉取');
-//   assert.strictEqual(src.p, '12.34,1,25,16777215,0', '原对象未被修改');
-//   assert.strictEqual(applyShiftToDanmu(null, 5), null, '空对象直接返回');
-// });
+test('nipaplay 中转弹弹play服务端工具函数', async (t) => {
+
+  // parseNipaplayRelatedLinks：解析 urls（|）与 shift（,），按主机名映射到内部源并还原时间偏移
+  const location = 'https://x.test/redirect?urls=https://www.bilibili.com/video/BV1xx|https://ani.gamer.com.tw/animeVideo.php?sn=12345&shift=0,30';
+  const parsed = parseNipaplayRelatedLinks(location);
+  assert.strictEqual(parsed.bilibili.length, 1, 'bilibili 链接被解析');
+  assert.strictEqual(parsed.bilibili[0].url, 'https://www.bilibili.com/video/BV1xx', 'bilibili 仅保留 BV 主体');
+  assert.strictEqual(parsed.bilibili[0].shift, 0, 'bilibili shift 为 0');
+  assert.strictEqual(parsed.bahamut.length, 1, 'bahamut 链接被解析');
+  assert.strictEqual(parsed.bahamut[0].url, 'https://ani.gamer.com.tw/animeVideo.php?sn=12345', 'bahamut 保留原始 URL');
+  assert.strictEqual(parsed.bahamut[0].shift, 30, 'bahamut shift 为 30');
+  assert.strictEqual(parsed.iqiyi.length, 0, '未提供平台为空');
+  for (const k of ['bilibili', 'bahamut', 'iqiyi', 'youku', 'tencent', 'imgo']) {
+    assert.deepStrictEqual(parseNipaplayRelatedLinks('')[k], [], `空字符串入参 ${k} 为空数组`);
+    assert.deepStrictEqual(parseNipaplayRelatedLinks(null)[k], [], `空入参 ${k} 为空数组`);
+  }
+
+  // resolveNipaplayLink：主机名到源路由，bahamut 提取 sn
+  assert.deepStrictEqual(resolveNipaplayLink('https://ani.gamer.com.tw/animeVideo.php?sn=999'), { source: 'bahamut', realId: '999' });
+  assert.deepStrictEqual(resolveNipaplayLink('https://v.qq.com/x/cover/abc.html'), { source: 'tencent', realId: 'https://v.qq.com/x/cover/abc.html' });
+  assert.deepStrictEqual(resolveNipaplayLink('https://www.bilibili.com/video/BVxyz'), { source: 'bilibili', realId: 'https://www.bilibili.com/video/BVxyz' });
+  assert.deepStrictEqual(resolveNipaplayLink('https://bilibili.com/video/BVxyz'), { source: 'bilibili', realId: 'https://bilibili.com/video/BVxyz' }, '无 www 前缀的裸域名同样归入 bilibili');
+  assert.deepStrictEqual(resolveNipaplayLink('https://b23.tv/BVxyz'), { source: 'bilibili', realId: 'https://b23.tv/BVxyz' }, 'b站短链 b23.tv 经统一映射归入 bilibili');
+  assert.deepStrictEqual(resolveNipaplayLink('https://unknown.example/x'), { source: null, realId: 'https://unknown.example/x' });
+
+  // parse 与 resolve 对 b23.tv 的识别保持一致：均归入 bilibili
+  const b23Location = 'https://x.test/redirect?urls=https://b23.tv/BV1xx&shift=0';
+  const b23Parsed = parseNipaplayRelatedLinks(b23Location);
+  assert.strictEqual(b23Parsed.bilibili.length, 1, 'b23.tv 链接经 parse 归入 bilibili');
+  assert.deepStrictEqual(resolveNipaplayLink(b23Parsed.bilibili[0].url), { source: 'bilibili', realId: b23Parsed.bilibili[0].url }, 'parse 与 resolve 对 b23.tv 的源识别一致');
+
+  // applyShiftToDanmu：校正时间偏移并标记实时拉取，不污染原对象
+  const src = { p: '12.34,1,25,16777215,0', t: 12.34 };
+  const shifted = applyShiftToDanmu(src, 5);
+  assert.strictEqual(shifted.p, '17.34,1,25,16777215,0', 'p 时间字段加偏移');
+  assert.strictEqual(shifted.t, 17.34, 't 加偏移');
+  assert.strictEqual(shifted.isRealTimePulled, true, '标记为实时拉取');
+  assert.strictEqual(src.p, '12.34,1,25,16777215,0', '原对象未被修改');
+  assert.strictEqual(applyShiftToDanmu(null, 5), null, '空对象直接返回');
+
+  // 负偏移使时间小于 0 时按通用偏移工具的行为钳到 0，避免产出负时间戳
+  const negative = { p: '5.00,1,25,16777215,0', t: 5 };
+  const clamped = applyShiftToDanmu(negative, -20);
+  assert.strictEqual(clamped.p, '0.00,1,25,16777215,0', '负偏移导致的负时间钳到 0');
+  assert.strictEqual(clamped.t, 0, 't 同步钳到 0');
+  assert.strictEqual(clamped.isRealTimePulled, true, '钳制后仍标记为实时拉取');
+
+  await t.test('账号或密码缺失时不请求 NipaPlay 中转弹弹play服务端，并提示先填写', async () => {
+    const savedAccount = Globals.envs.dandanplayAccount;
+    const savedPassword = Globals.envs.dandanplayPassword;
+    Globals.envs.dandanplayAccount = '';
+    Globals.envs.dandanplayPassword = '';
+    try {
+      assert.strictEqual(await fetchNipaplayDanmaku(1), null, '账号未配置时直接返回 null');
+      const result = await verifyNipaplayAccount('', '');
+      assert.strictEqual(result.ok, false, '缺少凭据时连通性测试不通过');
+      assert.match(result.message, /请先填写/, '提示先填写账号与密码');
+    } finally {
+      Globals.envs.dandanplayAccount = savedAccount;
+      Globals.envs.dandanplayPassword = savedPassword;
+    }
+  });
+});
+
+test('httpPatch 的 allow_redirects 与 GET/POST 行为一致', async () => {
+  let seenOptions = null;
+  const capture = async (url, options) => { seenOptions = options; return mockJsonResponse({}, url); };
+
+  await withMockFetch(capture, () => httpPatch('http://example.com/a', 'body', { allow_redirects: false }));
+  assert.strictEqual(seenOptions.redirect, 'manual', '禁止重定向时使用 manual');
+
+  await withMockFetch(capture, () => httpPatch('http://example.com/b', 'body', {}));
+  assert.strictEqual(seenOptions.redirect, 'follow', '默认跟随重定向');
+});
+
+test('dandan formatComments 按实时拉取标记区分处理', () => {
+  const dandan = new DandanSource();
+  const realtime = { cid: 1, p: '12.34,1,25,16777215,0', m: 'x', isRealTimePulled: true };
+  assert.strictEqual(dandan.formatComments([realtime])[0], realtime, '实时拉取弹幕原样返回');
+
+  const native = { cid: 1, p: '12.34,1,25,aFFFFFF,0', m: 'y' };
+  assert.strictEqual(dandan.formatComments([native])[0].p, '12.34,1,25,a16777215,0', '原生弹幕执行颜色转换');
+});
 
 test('fongmi-api season aware scoring', () => {
   // 季号提取: SxxExx / 第x季 / Season N / 2x05; 综艺日期与纯集数不误判

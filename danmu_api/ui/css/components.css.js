@@ -1604,38 +1604,6 @@ body[data-theme] input[type="checkbox"].app-checkbox:focus-visible {
     justify-content: center;
 }
 
-/* ============ Bilibili Cookie ============ */
-.bili-cookie-editor {
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-}
-
-.bili-cookie-status {
-    background: var(--theme-panel-bg);
-    padding: 12px;
-    border-radius: var(--app-radius-card-sm);
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    border-left: 3px solid var(--theme-accent);
-}
-
-.bili-status-icon {
-    font-size: 18px;
-}
-
-.bili-status-text {
-    flex: 1;
-    font-weight: 500;
-    font-size: 13px;
-}
-
-.bili-cookie-actions {
-    display: flex;
-    gap: 8px;
-}
-
 /* ============ 多选标签 & 合并模式 ============ */
 .selected-tag {
     display: inline-flex;
@@ -3087,14 +3055,18 @@ body[data-theme$="-dark"] .heatmap-bar {
     border-radius: 8px;
 }
 
-/* ============ AI API Key 编辑器 ============ */
-.ai-apikey-editor {
+/* ============ 凭证编辑器（AI API Key / 弹弹play密码 / B站 Cookie 共用） ============ */
+.ai-apikey-editor,
+.dandanplay-editor,
+.bili-cookie-editor {
     display: flex;
     flex-direction: column;
     gap: 14px;
 }
 
-.ai-apikey-status {
+.ai-apikey-status,
+.dandanplay-status,
+.bili-cookie-status {
     background: var(--theme-panel-bg);
     padding: 12px;
     border-radius: var(--app-radius-card-sm);
@@ -3104,17 +3076,23 @@ body[data-theme$="-dark"] .heatmap-bar {
     border-left: 3px solid var(--theme-accent);
 }
 
-.ai-status-icon {
+.ai-status-icon,
+.dandanplay-status-icon,
+.bili-status-icon {
     font-size: 18px;
 }
 
-.ai-status-text {
+.ai-status-text,
+.dandanplay-status-text,
+.bili-status-text {
     flex: 1;
     font-weight: 500;
     font-size: 13px;
 }
 
-.ai-apikey-actions {
+.ai-apikey-actions,
+.dandanplay-actions,
+.bili-cookie-actions {
     display: flex;
     gap: 8px;
 }
