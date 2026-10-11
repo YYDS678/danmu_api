@@ -1,7 +1,7 @@
 // =====================
 // 源注册表 (Source Registry)
 // =====================
-// 集中管理所有弹幕源的元数据与实例化，消除散落在 dandan-api.js / worker.test.js 中的
+// 集中管理所有弹幕源的元数据与实例化，消除散落在 dandan-api.js / danmu_api/tests/ 中的
 // import + new + if/else 分发三段重复代码。
 //
 // 新增一个源只需：

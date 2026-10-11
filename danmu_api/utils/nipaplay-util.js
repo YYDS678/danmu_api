@@ -290,6 +290,44 @@ async function requestNipaplayDanmaku(episodeId, retried) {
   return { comments, relatedLinks };
 }
 
+// 经 NipaPlay 中转弹弹play服务端获取作品详情：danmaku-anywhere 镜像弹弹play服务端详情接口未返回剧集时用作兜底。
+// 账号未配置或请求失败时返回 null，由调用方沿用原详情数据。
+export async function fetchNipaplayBangumiDetail(animeId) {
+  if (!isNipaplayAccountConfigured()) return null;
+  try {
+    return await requestNipaplayBangumiDetail(animeId, false);
+  } catch (error) {
+    log('error', `[dandan] [nipaplay] NipaPlay 中转弹弹play服务端详情请求失败: ${error.message}`);
+    return null;
+  }
+}
+
+async function requestNipaplayBangumiDetail(animeId, retried) {
+  const token = await getAccountToken();
+  const resp = await requestGateway((gateway) => httpGet(
+    `${gateway}/api/v2/bangumi/${animeId}`,
+    {
+      headers: {
+        'Accept': 'application/json',
+        'User-Agent': NIPAPLAY_USER_AGENT,
+        'Authorization': `Bearer ${token}`,
+      },
+      validStatusCodes: [200, 401],
+      retries: 1,
+    },
+  ));
+
+  // 令牌失效：清除缓存后重新登录并重试一次
+  if (resp.status === 401) {
+    if (retried) throw new Error('账号登录已失效');
+    log('info', '[dandan] [nipaplay] NipaPlay 中转弹弹play服务端详情返回登录失效，重新登录后重试');
+    clearAccountToken();
+    return requestNipaplayBangumiDetail(animeId, true);
+  }
+
+  return resp?.data?.bangumi || null;
+}
+
 // 校验弹弹play账号：以传入或已配置的账号密码登录，验证 NipaPlay 中转弹弹play服务端连通性与账号有效性；
 // 返回 { ok, message }，不写入运行期令牌缓存。
 export async function verifyNipaplayAccount(account, password) {

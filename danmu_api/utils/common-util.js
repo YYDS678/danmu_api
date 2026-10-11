@@ -377,23 +377,24 @@ export function titleMatches(title, query, parsedSeason = null, forceNonStrict =
 
 /**
  * 数据类型校验
- * @param {string} value - 值
- * @param {string} expectedType - 期望类型
- * @param {string} fieldName - 参数名称
+ * @param {*} value - 待校验的值
+ * @param {string} expectedType - 期望类型（array / boolean / number / string）
+ * @param {string} [fieldName] - 字段名，用于拼装错误信息，缺省时以值本身代替
  */
-export function validateType(value, expectedType) {
-  const fieldName = value?.constructor?.name;  // 获取字段名
+export function validateType(value, expectedType, fieldName) {
+  const label = fieldName || `${value}`;
+  const received = value === null ? "null" : Array.isArray(value) ? "array" : typeof value;
   if (expectedType === "array") {
     if (!Array.isArray(value)) {
-      throw new TypeError(`${value} 必须是一个数组，但传入的是 ${fieldName}`);
+      throw new TypeError(`${label} 必须是一个数组，但传入的是 ${received}`);
     }
   } else if (expectedType === "boolean") {
     // 对于 boolean 类型，允许任何可转换为布尔值的类型（number, boolean）
     if (typeof value !== "boolean" && typeof value !== "number") {
-      throw new TypeError(`${value} 必须是 boolean 或 number，但传入的是 ${fieldName}`);
+      throw new TypeError(`${label} 必须是 boolean 或 number，但传入的是 ${received}`);
     }
   } else if (typeof value !== expectedType) {
-    throw new TypeError(`${value} 必须是 ${expectedType}，但传入的是 ${fieldName}`);
+    throw new TypeError(`${label} 必须是 ${expectedType}，但传入的是 ${received}`);
   }
 }
 

@@ -478,35 +478,48 @@ export default class HanjutvSource extends BaseSource {
    */
   async extractFromPayload(payload, uid, tag) {
     if (!payload || typeof payload !== "object") throw new Error(`${tag} 响应为空`);
+    const code = payload.rescode ?? payload.code;
+    if (code != null && Number(code) !== 0) throw new Error(`${tag} 接口返回错误: ${code}`);
 
+    let data = payload;
     if (typeof payload.data === "string" && payload.data.length > 0) {
-      let decoded;
       try {
-        decoded = await decodeHanjutvEncryptedPayload(payload, uid);
+        data = await decodeHanjutvEncryptedPayload(payload, uid);
       } catch (error) {
         throw new Error(`${tag} 响应解密失败: ${error.message}`);
       }
-      const items = this.extractSearchItems(decoded);
-      if (items.length === 0) throw new Error(`${tag} 解密后无有效结果`);
-      return items;
     }
 
-    const items = this.extractSearchItems(payload);
-    if (items.length === 0) throw new Error(`${tag} 无有效结果`);
+    // 明确的空列表表示没有匹配结果；只有缺少列表的空壳或无效数据才需要恢复。
+    const list = data?.seriesData?.seriesList ?? data?.seriesList ?? data?.seriesData?.series;
+    if (!Array.isArray(list)) throw new Error(`${tag} 响应缺少有效搜索列表`);
+    if (list.length === 0) {
+      log("info", `[hanjutv] ${tag} 搜索无结果`);
+      return [];
+    }
+    const items = this.extractSearchItems(data);
+    if (items.length === 0) throw new Error(`${tag} 搜索列表无有效条目`);
     return items;
   }
 
-  async warmupMobileIdentity(headers) {
+  async warmupMobileIdentity(headers, bypassCache = false) {
     try {
-      await httpGet(`${this.appHost}/api/common/configs`, { headers, timeout: 8000, retries: 0 });
+      const resp = await httpGet(`${this.appHost}/api/common/configs`, {
+        headers, timeout: 3000, retries: 0, bypassCache,
+      });
+      const data = resp?.data;
+      if (data?.rescode !== 0 || !data.globalConfigs || typeof data.globalConfigs !== "object"
+        || Array.isArray(data.globalConfigs) || !Array.isArray(data.tabs)) {
+        throw new Error("configs 响应缺少有效初始化配置");
+      }
       return true;
-    } catch (_) {
-      // 暖身失败不阻断搜索，下一次搜索会再次尝试。
+    } catch (error) {
+      log("warn", `[hanjutv] 手机身份初始化失败: ${error.message}`);
       return false;
     }
   }
 
-  async ensureMobileIdentityWarmed() {
+  async ensureMobileIdentityWarmed(bypassCache = false) {
     if (this._mobileWarmedUid) return true;
     if (this._mobileWarmupPromise) return this._mobileWarmupPromise;
 
@@ -514,7 +527,7 @@ export default class HanjutvSource extends BaseSource {
       const headerInfo = await this.buildMobileHeaders();
       if (this._mobileWarmedUid === headerInfo.uid) return true;
 
-      const warmed = await this.warmupMobileIdentity(headerInfo.headers);
+      const warmed = await this.warmupMobileIdentity(headerInfo.headers, bypassCache);
       if (warmed) this._mobileWarmedUid = headerInfo.uid;
       return warmed;
     })();
@@ -530,16 +543,28 @@ export default class HanjutvSource extends BaseSource {
   }
 
   async searchWithS5Api(keyword) {
-    await this.ensureMobileIdentityWarmed();
-
-    const { uid, headers } = await this.buildMobileHeaders();
     const q = encodeURIComponent(keyword);
-    const resp = await httpGet(`https://hxqapi.hiyun.tv/api/search/s5?k=${q}&srefer=search_input&type=0&page=1`, {
-      headers,
-      timeout: 10000,
-      retries: 1,
-    });
-    return this.extractFromPayload(resp?.data, uid, "s5");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (!await this.ensureMobileIdentityWarmed(attempt > 0)) {
+          throw new Error("s5 手机身份初始化失败");
+        }
+        const { uid, headers } = await this.buildMobileHeaders();
+        const resp = await httpGet(`${this.appHost}/api/search/s5?k=${q}&srefer=search_input&type=0&page=1`, {
+          headers,
+          timeout: 10000,
+          // 恢复由外层统一控制，避免叠加 HTTP 重试；恢复请求必须绕过异常响应缓存。
+          retries: 0,
+          bypassCache: attempt > 0,
+        });
+        return await this.extractFromPayload(resp?.data, uid, "s5");
+      } catch (error) {
+        // 保留原身份，只重新初始化一次；仍失败则由 search() 保留 TV 端结果。
+        this._mobileWarmedUid = null;
+        if (attempt === 1) throw error;
+        log("warn", `[hanjutv] s5 搜索异常，重新初始化并重试一次: ${error.message}`);
+      }
+    }
   }
 
   async searchWithTvApi(keyword) {
@@ -567,7 +592,7 @@ export default class HanjutvSource extends BaseSource {
       const totalMatched = stats.s5Matched + stats.tvMatched;
 
       if (resultList.length > 0 && totalMatched === 0) {
-        log("warn", `[hanjutv] 所有候选均未命中关键词，丢弃疑似推荐流结果: ${key}`);
+        log("info", `[hanjutv] 所有候选均未命中关键词，丢弃疑似推荐流结果: ${key}`);
         return [];
       }
 

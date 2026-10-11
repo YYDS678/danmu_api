@@ -37,10 +37,18 @@ export function md5(message) {
       } else if (charCode < 0x800) {
         utf8 += String.fromCharCode(0xc0 | (charCode >> 6));
         utf8 += String.fromCharCode(0x80 | (charCode & 0x3f));
-      } else {
+      } else if (charCode < 0xd800 || charCode >= 0xe000) {
         utf8 += String.fromCharCode(0xe0 | (charCode >> 12));
         utf8 += String.fromCharCode(0x80 | ((charCode >> 6) & 0x3f));
         utf8 += String.fromCharCode(0x80 | (charCode & 0x3f));
+      } else {
+        // 代理对（emoji 等增补平面字符）：需先合成真实码点再编成 4 字节，
+        // 否则会按 CESU-8 各编 3 字节，得到的摘要与标准 MD5(UTF-8) 不一致。
+        const codePoint = 0x10000 + (((charCode & 0x3ff) << 10) | (str.charCodeAt(++i) & 0x3ff));
+        utf8 += String.fromCharCode(0xf0 | (codePoint >> 18));
+        utf8 += String.fromCharCode(0x80 | ((codePoint >> 12) & 0x3f));
+        utf8 += String.fromCharCode(0x80 | ((codePoint >> 6) & 0x3f));
+        utf8 += String.fromCharCode(0x80 | (codePoint & 0x3f));
       }
     }
     return utf8;

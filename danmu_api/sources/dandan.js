@@ -2,7 +2,7 @@ import BaseSource from './base.js';
 import { globals } from '../configs/globals.js';
 import { log } from "../utils/log-util.js";
 import { httpGet } from "../utils/http-util.js";
-import { fetchNipaplayDanmaku, resolveNipaplayLink, applyShiftToDanmu } from '../utils/nipaplay-util.js';
+import { fetchNipaplayDanmaku, fetchNipaplayBangumiDetail, resolveNipaplayLink, applyShiftToDanmu } from '../utils/nipaplay-util.js';
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
 import { SegmentListResponse } from '../models/dandan-model.js';
 import { getTmdbJaOriginalTitle, smartTitleReplace } from "../utils/tmdb-util.js";
@@ -51,7 +51,9 @@ export default class DandanSource extends BaseSource {
             imageUrl: "", 
             startDate: m.begin,
             rating: 0,
-			aliases: [...m.titles]
+            aliases: [...m.titles],
+            // 标题与别名取自 Bangumi Data，详情接口不可用时不重复补全
+            _bangumiDataHit: true
           };
         });
       }
@@ -66,6 +68,7 @@ export default class DandanSource extends BaseSource {
       // 第一次搜索：使用原始关键词搜索番剧列表
       const originalSearchPromise = (async () => {
         try {
+          // 经 danmaku-anywhere 镜像弹弹play服务端搜索作品（镜像侧数据按 TTL 延迟更新）
           const resp = await httpGet(`https://api.danmaku.weeblify.app/ddp/v1?path=/v2/search/anime?keyword=${keyword}`, {
             headers: {
               "Content-Type": "application/json",
@@ -119,6 +122,7 @@ export default class DandanSource extends BaseSource {
           log("info", `[dandan] 使用日语原名通过 episodes 接口进行搜索: ${tmdbTitle}`);
 
           // episodes 接口对日语原名的支持更好，使用其进行 TMDB 原名搜索
+          // 经 danmaku-anywhere 镜像弹弹play服务端按 TMDB 原名搜索剧集
           const resp = await httpGet(`https://api.danmaku.weeblify.app/ddp/v1?path=/v2/search/episodes?anime=${encodeURIComponent(tmdbTitle)}`, {
             headers: {
               "Content-Type": "application/json",
@@ -250,8 +254,9 @@ export default class DandanSource extends BaseSource {
   }
 
   // 获取番剧详情和剧集列表
-  async getEpisodes(id) {
+  async getEpisodes(id, contextAnime = null) {
     try {
+      // 经 danmaku-anywhere 镜像弹弹play服务端获取作品详情与剧集列表
       const resp = await httpGet(`https://api.danmaku.weeblify.app/ddp/v1?path=/v2/bangumi/${id}`, {
         headers: {
           "Content-Type": "application/json",
@@ -263,64 +268,111 @@ export default class DandanSource extends BaseSource {
       // 判断 resp 和 resp.data 是否存在
       if (!resp || !resp.data) {
         log("info", "[dandan] getDandanEposides: 请求失败或无数据返回");
-        return { episodes: [], titles: [], relateds: [], type: null, typeDescription: null };
+        return await this.resolveUnavailableDetail(id, contextAnime);
       }
 
       // 判断 bangumi 数据是否存在
       if (!resp.data.bangumi) {
         log("info", "[dandan] getDandanEposides: bangumi 数据不存在");
-        return { episodes: [], titles: [], relateds: [], type: null, typeDescription: null };
+        return await this.resolveUnavailableDetail(id, contextAnime);
       }
 
       const bangumiData = resp.data.bangumi;
 
-      // 提取剧集列表，确保它是数组
-      const episodes = Array.isArray(bangumiData.episodes) ? bangumiData.episodes : [];
+      // danmaku-anywhere 镜像弹弹play服务端详情接口未返回剧集时由 NipaPlay 中转弹弹play服务端兜底：danmaku-anywhere 镜像服务端集未更新时取原站数据
+      const nipaplayDetail = (Array.isArray(bangumiData.episodes) ? bangumiData.episodes.length : 0) === 0
+        ? await fetchNipaplayBangumiDetail(id)
+        : null;
+      if (nipaplayDetail) log("info", "[dandan] getDandanEposides: danmaku-anywhere 镜像弹弹play服务端未返回剧集，详情取自 NipaPlay 中转弹弹play服务端");
+      const detail = nipaplayDetail || bangumiData;
 
-      // 提取标题别名列表
-      // 数据源格式: [{"language":"主标题","title":"雨天遇见狸"}, ...]
-      const titles = Array.isArray(bangumiData.titles) ? bangumiData.titles.map(t => t.title) : [];
-
-      // 提取相关作品列表以供系列扩展搜索
-      const relateds = Array.isArray(bangumiData.relateds) ? bangumiData.relateds : [];
-
-      // 提取番剧类型信息，用于相关作品无法从搜索接口获取该字段时的数据补全
-      const type = bangumiData.type || null;
-      let typeDescription = bangumiData.typeDescription || null;
-
-      // 识别 3D 与 2D 标签并追加至类型描述
-      let is3D = false;
-      let is2D = false;
-      if (bangumiData.tags && Array.isArray(bangumiData.tags)) {
-          bangumiData.tags.forEach(tag => {
-              if (tag.name && tag.name.toUpperCase().includes('3D')) is3D = true;
-              if (tag.name && tag.name.toUpperCase().includes('2D')) is2D = true;
-          });
-      }
-      if (is3D) {
-          typeDescription = "3D" + (typeDescription || "");
-      } else if (is2D) {
-          typeDescription = "2D" + (typeDescription || "");
-      }
-
-      // 提取封面图片 URL，用于 episodes 接口返回结果缺少 imageUrl 时的数据补全
-      const imageUrl = bangumiData.imageUrl || null;
-
-      // 正常情况下输出 JSON 字符串
-      log("info", `[dandan] getDandanEposides: ${JSON.stringify(resp.data.bangumi.episodes)}`);
-
-      // 返回包含剧集、别名、相关作品、类型及封面信息的完整对象
-      return { episodes, titles, relateds, type, typeDescription, imageUrl };
+      return await this.extractDetailResult(id, detail);
 
     } catch (error) {
-      // 捕获请求中的错误
+      // 捕获请求中的错误：httpGet 重试耗尽后以异常抛出，此处同样进入详情不可用的兜底
       log("error", "[dandan] getDandanEposides error:", {
         message: error.message,
         name: error.name,
         stack: error.stack,
       });
-      return { episodes: [], titles: [], relateds: [], type: null, typeDescription: null, imageUrl: null };
+      return await this.resolveUnavailableDetail(id, contextAnime);
     }
+  }
+
+  // 详情接口重试后仍不可用时的兜底：NipaPlay 中转弹弹play服务端优先，其次按 Bangumi Data 补全剧集。
+  // Bangumi Data 不提供相关作品、标签与封面，返回空值；标题与别名仅在搜索条目未由 Bangumi Data 提供时补全。
+  async resolveUnavailableDetail(id, contextAnime, lookupItem = lookupBangumiDataItemByAnime) {
+    const nipaplayDetail = await fetchNipaplayBangumiDetail(id);
+    if (nipaplayDetail) {
+      log("info", "[dandan] getDandanEposides: 详情接口不可用，详情取自 NipaPlay 中转弹弹play服务端");
+      return await this.extractDetailResult(id, nipaplayDetail);
+    }
+
+    const item = await lookupItem(contextAnime, id);
+    if (!item) {
+      log("info", `[dandan] getDandanEposides: 详情接口不可用，Bangumi Data 未命中条目（作品 ${id}）`);
+      return emptyEpisodeDetail();
+    }
+
+    // 整部无集：按 Bangumi Data 的放送区间推算集数；详情不可用故无 metadata 可回退，lookup 直接复用已定位到的条目
+    const filledEpisodes = await fillMissingEpisodes(id, { metadata: [] }, [], async () => item);
+    if (filledEpisodes.length === 0) return emptyEpisodeDetail();
+
+    const fromBangumiData = contextAnime?._bangumiDataHit === true;
+    const titles = fromBangumiData ? [] : [...new Set(item.titles || [])];
+    log("info", `[dandan] getDandanEposides: 详情接口不可用，按 Bangumi Data 补全 ${filledEpisodes.length} 集（作品 ${id}）`);
+    return {
+      episodes: filledEpisodes,
+      titles,
+      relateds: [],
+      type: item.typeId || null,
+      typeDescription: item.typeStr || null,
+      imageUrl: null,
+    };
+  }
+
+  // 从详情数据提取剧集、别名、相关作品、类型与封面，并按 Bangumi Data 的放送区间补全缺失集
+  async extractDetailResult(id, detail) {
+    // 提取剧集列表，确保它是数组
+    const episodes = Array.isArray(detail.episodes) ? detail.episodes : [];
+
+    // 提取标题别名列表
+    // 数据源格式: [{"language":"主标题","title":"雨天遇见狸"}, ...]
+    const titles = Array.isArray(detail.titles) ? detail.titles.map(t => t.title) : [];
+
+    // 提取相关作品列表以供系列扩展搜索
+    const relateds = Array.isArray(detail.relateds) ? detail.relateds : [];
+
+    // 提取番剧类型信息，用于相关作品无法从搜索接口获取该字段时的数据补全
+    const type = detail.type || null;
+    let typeDescription = detail.typeDescription || null;
+
+    // 识别 3D 与 2D 标签并追加至类型描述
+    let is3D = false;
+    let is2D = false;
+    if (detail.tags && Array.isArray(detail.tags)) {
+      detail.tags.forEach(tag => {
+        if (tag.name && tag.name.toUpperCase().includes('3D')) is3D = true;
+        if (tag.name && tag.name.toUpperCase().includes('2D')) is2D = true;
+      });
+    }
+    if (is3D) {
+      typeDescription = "3D" + (typeDescription || "");
+    } else if (is2D) {
+      typeDescription = "2D" + (typeDescription || "");
+    }
+
+    // 提取封面图片 URL，用于 episodes 接口返回结果缺少 imageUrl 时的数据补全
+    const imageUrl = detail.imageUrl || null;
+
+    // 集缺失时按 Bangumi Data 的放送区间推理补全：覆盖 danmaku-anywhere 镜像弹弹play服务端集未更新与整部无集两种情形
+    const filledEpisodes = await fillMissingEpisodes(id, detail, episodes);
+
+    // 正常情况下输出 JSON 字符串
+    log("info", `[dandan] getDandanEposides: ${JSON.stringify(filledEpisodes)}`);
+
+    // 返回包含剧集、别名、相关作品、类型及封面信息的完整对象
+    return { episodes: filledEpisodes, titles, relateds, type, typeDescription, imageUrl };
   }
 
   // 计算两个字符串的文本相似度（字符集交并比算法）
@@ -399,7 +451,7 @@ export default class DandanSource extends BaseSource {
       await Promise.all(currentBatch.map(async (anime) => {
         try {
           // 获取详情数据（包含剧集、别名和相关作品）
-          const details = await this.getEpisodes(anime.animeId);
+          const details = await this.getEpisodes(anime.animeId, anime);
           const eps = details.episodes; // 提取剧集列表
           const apiAliases = details.titles || []; // 提取 API 返回的别名列表
 
@@ -638,6 +690,165 @@ export default class DandanSource extends BaseSource {
   }
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+const WEEK_MS = 7 * DAY_MS;
+
+// 补全集标题标记，用于区分系统按放送区间推理出的集
+const SYSTEM_FILLED_MARK = '（系统补全）';
+
+// 解析时间字符串为毫秒时间戳，无法解析时返回 null
+function parseTimeValue(value) {
+  if (!value || typeof value !== 'string') return null;
+  const time = Date.parse(value);
+  return Number.isFinite(time) ? time : null;
+}
+
+// 从详情接口 metadata 的「放送开始」提取放送日期；仅记录到年（如「放送开始: 2026年」）时无法确定周次，返回 null
+export function extractBroadcastStart(metadata) {
+  if (!Array.isArray(metadata)) return null;
+  const entry = metadata.find((line) => typeof line === 'string' && line.trim().startsWith('放送开始'));
+  const match = entry && entry.match(/(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日/);
+  if (!match) return null;
+  const time = Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]));
+  return Number.isFinite(time) ? time : null;
+}
+
+// 详情接口的 bangumiUrl 指向 bangumi.tv/subject/{id}，据此与 Bangumi Data 条目的站点 id 精确对应
+function extractBangumiSubjectId(bangumiUrl) {
+  const match = typeof bangumiUrl === 'string' ? bangumiUrl.match(/(?:bangumi|bgm)\.tv\/subject\/(\d+)/) : null;
+  return match ? match[1] : null;
+}
+
+// 按一周一集推算从放送开始到指定时间应有的集数（含首集）
+function countEpisodesWeekly(beginTime, untilTime) {
+  return Math.floor((untilTime - beginTime) / WEEK_MS) + 1;
+}
+
+// 生成补全集：集号自现有正片集顺延，id 沿用弹弹play 的 animeId + 4 位集号，插入在正片之后、番外之前
+function buildFilledEpisodes(animeId, episodes, totalCount) {
+  const normalNumbers = episodes
+    .filter((ep) => /^\d+$/.test(String(ep.episodeNumber ?? '')))
+    .map((ep) => Number(ep.episodeNumber));
+  const lastNumber = normalNumbers.length > 0 ? Math.max(...normalNumbers) : 0;
+  const filled = [];
+  for (let n = lastNumber + 1; n <= totalCount; n++) {
+    filled.push({
+      seasonId: null,
+      episodeId: Number(`${animeId}${String(n).padStart(4, '0')}`),
+      episodeTitle: `第${n}话 ${SYSTEM_FILLED_MARK}`,
+      episodeNumber: String(n),
+      lastWatched: null,
+      airDate: null,
+    });
+  }
+  if (filled.length === 0) return episodes;
+  const lastNormalIndex = episodes.reduce((acc, ep, i) => (/^\d+$/.test(String(ep.episodeNumber ?? '')) ? i : acc), -1);
+  return [...episodes.slice(0, lastNormalIndex + 1), ...filled, ...episodes.slice(lastNormalIndex + 1)];
+}
+
+// 详情不可用且兜底无结果时的空返回，保持调用方原有的字段结构
+function emptyEpisodeDetail() {
+  return { episodes: [], titles: [], relateds: [], type: null, typeDescription: null, imageUrl: null };
+}
+
+// 从按 anidb 与 bangumi 站点检索出的结果中挑选对应条目。弹弹play 的作品 id 与 Bangumi Data 的 anidb 站点 id 同源，优先取 anidb id 一致且唯一的一条。
+// 同一 anidb id 对应多个分部条目、或该作品没有 anidb 站点记录时，回退到 bangumi 站点 id。
+export function selectBangumiDataItem(matches, animeId, subjectId) {
+  const anidbMatches = (matches || []).filter((m) => m.matchedSiteKey === 'anidb' && String(m.siteId) === String(animeId));
+  if (anidbMatches.length === 1) return anidbMatches[0];
+  return (matches || []).find((m) => m.matchedSiteKey === 'bangumi' && String(m.siteId) === subjectId) || null;
+}
+
+// 在 Bangumi Data 中定位详情接口对应的条目：标题取自详情接口主标题
+async function lookupBangumiDataItem(detail, animeId) {
+  const searchTitle = (Array.isArray(detail.titles) ? detail.titles.find((t) => t?.language === '主标题')?.title : null)
+    || detail.animeTitle;
+  if (!searchTitle) return null;
+  const matches = await searchBangumiData(searchTitle, ['anidb', 'bangumi']);
+  return selectBangumiDataItem(matches, animeId, extractBangumiSubjectId(detail.bangumiUrl));
+}
+
+// 详情接口不可用时以搜索条目的标题与别名在 Bangumi Data 中逐个检索：此时详情主标题不可得，只能以搜索条目作检索词
+async function lookupBangumiDataItemByAnime(anime, animeId) {
+  const keywords = [anime?.animeTitle, ...(anime?.aliases || [])].filter(Boolean);
+  for (const keyword of keywords) {
+    const matches = await searchBangumiData(keyword, ['anidb']);
+    const item = selectBangumiDataItem(matches, animeId, null);
+    if (item) return item;
+  }
+  return null;
+}
+
+// 放送截止日期与用户系统时间均不可知时按该集数补全（云部署等环境下运行期时间不可用时的兜底）
+const DEFAULT_FILL_EPISODE_COUNT = 26;
+
+// 集数推算上限：按放送区间一周一集线性推集会随放送时长放大（长寿番可推至数千集），超过上限时按上限处理
+const MAX_FILL_EPISODE_COUNT = 100;
+
+// 集数推算结果的日志文本：超过上限时注明按上限补全，并保留原始推算值
+function describeFillCount(inferredCount) {
+  return inferredCount > MAX_FILL_EPISODE_COUNT
+    ? `${inferredCount} 集，超过上限按 ${MAX_FILL_EPISODE_COUNT} 集补全`
+    : `${inferredCount} 集`;
+}
+
+// 按 Bangumi Data 的放送区间推理并补全详情接口缺失的集。
+// 放送开始须可取到（Bangumi Data 的 begin，缺失时回退详情接口 metadata 的放送开始），取不到时不补全。
+// 放送截止依次回退 end、用户系统时间（按当前周推算并额外补两集）、默认集数。
+// 已有集时仅补齐末集之后的集，整部无集时按放送区间推算总集数，推算集数受 MAX_FILL_EPISODE_COUNT 约束。
+export async function fillMissingEpisodes(animeId, detail, episodes, lookupItem = lookupBangumiDataItem, now = Date.now()) {
+  // 补全日志的作品标识：作品 id 与主标题，用于区分同一次流程中不同作品的判定结果
+  const mainTitle = (Array.isArray(detail.titles) ? detail.titles.find((t) => t?.language === '主标题')?.title : null) || detail.animeTitle || '';
+  const fillLabel = mainTitle ? `${animeId} ${mainTitle}` : `${animeId}`;
+  const normalEpisodes = episodes.filter((ep) => /^\d+$/.test(String(ep.episodeNumber ?? '')));
+  const lastAirTime = normalEpisodes.length > 0
+    ? parseTimeValue(normalEpisodes[normalEpisodes.length - 1].airDate)
+    : null;
+  // 末集放送日期在一周内时不可能缺集，无需查询 Bangumi Data
+  if (episodes.length > 0 && lastAirTime !== null && now - lastAirTime < WEEK_MS) return episodes;
+
+  const item = await lookupItem(detail, animeId);
+  const beginTime = parseTimeValue(item?.begin) ?? extractBroadcastStart(detail.metadata);
+  if (beginTime === null) {
+    log("info", `[dandan] 集补全跳过（${fillLabel}）：放送开始时间不可知`);
+    return episodes;
+  }
+  const endTime = parseTimeValue(item?.end);
+
+  if (episodes.length === 0) {
+    let totalCount;
+    if (endTime !== null) {
+      totalCount = countEpisodesWeekly(beginTime, endTime);
+      log("info", `[dandan] 集补全（${fillLabel}，整部无集，按放送区间）: 应有 ${describeFillCount(totalCount)}`);
+    } else if (Number.isFinite(now)) {
+      totalCount = countEpisodesWeekly(beginTime, now) + 2;
+      log("info", `[dandan] 集补全（${fillLabel}，整部无集，放送截止不可知按当前周并额外补两集）: 应有 ${describeFillCount(totalCount)}`);
+    } else {
+      totalCount = DEFAULT_FILL_EPISODE_COUNT;
+      log("info", `[dandan] 集补全（${fillLabel}，整部无集，放送截止与系统时间均不可知，按默认集数）: 应有 ${describeFillCount(totalCount)}`);
+    }
+    return buildFilledEpisodes(animeId, episodes, Math.max(1, Math.min(MAX_FILL_EPISODE_COUNT, totalCount)));
+  }
+
+  if (endTime === null) {
+    log("info", `[dandan] 集补全跳过（${fillLabel}）：已存在集且放送截止不可知`);
+    return episodes;
+  }
+  // 末集放送日期与放送结束相同或相差不超过两天，说明中途有周未放送，集数正确
+  if (lastAirTime !== null && Math.abs(endTime - lastAirTime) <= 2 * DAY_MS) {
+    log("info", `[dandan] 集补全跳过（${fillLabel}）：末集放送日期已对齐放送截止`);
+    return episodes;
+  }
+  const inferredCount = countEpisodesWeekly(beginTime, endTime);
+  const totalCount = Math.min(MAX_FILL_EPISODE_COUNT, inferredCount);
+  if (totalCount <= normalEpisodes.length) {
+    log("info", `[dandan] 集补全跳过（${fillLabel}）：按放送区间应有 ${totalCount} 集，未超过现有 ${normalEpisodes.length} 集`);
+    return episodes;
+  }
+  log("info", `[dandan] 集补全（${fillLabel}，补齐末集之后的集）: 按放送区间应有 ${describeFillCount(inferredCount)}，现有 ${normalEpisodes.length} 集，补 ${totalCount - normalEpisodes.length} 集`);
+  return buildFilledEpisodes(animeId, episodes, totalCount);
+}
+
 const DandanUserAgent = `LogVar Danmu API/${globals.version}`
 
 // 源标识 → 平台标识映射，与核心路由一致（见 ALLOWED_PLATFORMS：bilibili1/qq/qiyi/imgo 等），
@@ -727,6 +938,7 @@ async function getRelatedDanmuViaNipaplay(links, coveredSources) {
 // 请求弹弹play原生弹幕：未配置弹弹play账号或 NipaPlay 中转弹弹play服务端不可用时使用；失败时返回空数组以免阻断后续流程。
 async function fetchDandanComments(id) {
   try {
+    // 经 danmaku-anywhere 镜像弹弹play服务端获取弹弹play原生弹幕
     const resp = await httpGet(`https://api.danmaku.weeblify.app/ddp/v1?path=%2Fv2%2Fcomment%2F${id}%3Ffrom%3D0%26withRelated%3Dtrue%26chConvert%3D0`, {
       headers: {
         "Content-Type": "application/json",
