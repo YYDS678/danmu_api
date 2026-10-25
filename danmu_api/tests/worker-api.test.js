@@ -692,6 +692,156 @@ test('worker 边缘入口：favicon / robots.txt / OPTIONS 直接返回 204 与 
   }
 });
 
+test('worker Fongmi 弹幕接口：根路径、/danmaku 及尾斜杠写法均可使用', async () => {
+  const headers = { 'content-type': 'application/x-www-form-urlencoded' };
+  const body = 'name=&episode=1';
+
+  for (const path of [
+    '/',
+    '/danmaku',
+    '/danmaku/',
+    '/danmaku/api/v2/fongmi/danmaku',
+    '/danmaku/api/v2/fongmi/danmaku/',
+  ]) {
+    const result = await callWorker(`http://localhost${path}`, { method: 'POST', headers, body });
+    assert.strictEqual(result.status, 200, `${path} 应命中 Fongmi 接口`);
+    assert.deepStrictEqual(result.json, [], `${path} 无标题时应返回空候选列表`);
+  }
+
+  const rootUi = await callWorker('http://localhost/');
+  assert.strictEqual(rootUi.status, 200);
+  assert.match(rootUi.response.headers.get('content-type') || '', /text\/html/, '普通根路径仍需返回管理页面');
+
+  const rootGet = await callWorker('http://localhost/?name=&episode=1');
+  assert.strictEqual(rootGet.status, 200);
+  assert.deepStrictEqual(rootGet.json, [], '带 name 的根路径 GET 应命中 Fongmi 接口');
+
+  const rootWithoutName = await callWorker('http://localhost/?episode=1');
+  assert.match(rootWithoutName.response.headers.get('content-type') || '', /text\/html/, '只有 episode 时仍返回管理页面');
+
+  const tokenEnv = { TOKEN: 'user-token-1' };
+  const tokenRoot = await callWorker('http://localhost/user-token-1', { method: 'POST', headers, body, env: tokenEnv });
+  assert.strictEqual(tokenRoot.status, 200, '自定义 TOKEN 下根地址也应可用');
+  assert.deepStrictEqual(tokenRoot.json, []);
+
+  const missingToken = await callWorker('http://localhost/', { method: 'POST', headers, body, env: tokenEnv });
+  assert.strictEqual(missingToken.status, 401, '自定义 TOKEN 下不能绕过鉴权');
+});
+
+test('worker Fongmi 非空候选：返回的弹幕 URL 可访问 XML，并保留鉴权前缀', async (t) => {
+  resetSearchState();
+  const anime = {
+    animeId: 500010,
+    bangumiId: '500010',
+    animeTitle: 'Fongmi兼容测试番剧',
+    type: 'tvseries',
+    typeDescription: 'TV',
+    imageUrl: '',
+    startDate: '2024-01-01T00:00:00.000Z',
+    episodeCount: 1,
+    rating: 0,
+    isFavorited: false,
+    source: 'tencent',
+    links: [{ id: 31010, url: 'https://v.qq.com/x/cover/fongmi/ep1.html', title: '【qq】 第1集' }],
+  };
+  Globals.searchCache.set(anime.animeTitle, {
+    results: [createSearchResult(anime)],
+    details: [anime],
+    timestamp: Date.now(),
+  });
+  t.mock.method(TencentSource.prototype, 'getComments', async () => [
+    { p: '12.3,1,16777215,qq', m: 'Fongmi回归测试弹幕' },
+  ]);
+
+  const params = { name: anime.animeTitle, episode: '1' };
+  const query = new URLSearchParams(params).toString();
+  const tokenEnv = { TOKEN: 'user-token-1', ADMIN_TOKEN: 'admin-tok' };
+  const requests = [
+    ['GET', `?${query}`, { method: 'GET' }],
+    ['表单 POST', '', { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: query }],
+    ['JSON POST', '', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(params) }],
+  ];
+
+  try {
+    for (const [path, env, prefix] of [
+      ['/', {}, ''],
+      ['/danmaku/', {}, ''],
+      ['/api/v2/fongmi/danmaku', {}, ''],
+      ['/danmaku/api/v2/fongmi/danmaku/', {}, ''],
+      ['/danmaku//api/v2/fongmi/danmaku/', {}, ''],
+      ['/api//v2/fongmi/danmaku', {}, ''],
+      ['/user-token-1', tokenEnv, '/user-token-1'],
+      ['/user-token-1//danmaku//api/v2/fongmi/danmaku/', tokenEnv, '/user-token-1'],
+      ['/admin-tok/', tokenEnv, '/admin-tok'],
+      ['/admin-tok//danmaku//api/v2/fongmi/danmaku/', tokenEnv, '/admin-tok'],
+      ['/danmaku', { TOKEN: 'danmaku' }, '/danmaku'],
+    ]) {
+      for (const [methodLabel, suffix, options] of requests) {
+        const label = `${methodLabel} ${path}`;
+        const result = await callWorker(`http://localhost${path}${suffix}`, { ...options, env });
+        assert.strictEqual(result.status, 200, `${label} 应返回候选`);
+        assert.deepStrictEqual(result.json, [{
+          name: `${anime.animeTitle} - ${anime.links[0].title}`,
+          url: `http://localhost${prefix}/api/v2/comment/31010?format=xml`,
+        }], `${label} 应返回有效的弹幕地址`);
+
+        const comment = await callWorker(result.json[0].url, { env });
+        assert.strictEqual(comment.status, 200, `${label} 的弹幕地址应可访问`);
+        assert.match(comment.response.headers.get('content-type') || '', /xml/, `${label} 应返回 XML`);
+        assert.match(comment.text, /<d\b[^>]*>Fongmi回归测试弹幕<\/d>/, `${label} 应包含弹幕内容`);
+      }
+    }
+  } finally {
+    resetSearchState();
+  }
+});
+
+test('worker Fongmi 请求统计：带 token 的根地址记录一次请求，普通首页不计数', async () => {
+  const previousRecords = Globals.reqRecords;
+  const previousTodayReqNum = Globals.todayReqNum;
+  const tokenEnv = { TOKEN: 'user-token-1', ADMIN_TOKEN: 'admin-tok' };
+
+  try {
+    for (const [path, env] of [
+      ['/', {}],
+      ['/87654321', {}],
+      ['/user-token-1', tokenEnv],
+      ['/user-token-1/', tokenEnv],
+      ['/admin-tok', tokenEnv],
+      ['/admin-tok/', tokenEnv],
+    ]) {
+      Globals.reqRecords = [];
+      Globals.todayReqNum = 0;
+      const ui = await callWorker(`http://localhost${path}`, { env });
+      assert.match(ui.response.headers.get('content-type') || '', /text\/html/);
+      assert.strictEqual(Globals.reqRecords.length, 0, `${path} 普通首页不应记录为弹幕请求`);
+      assert.strictEqual(Globals.todayReqNum, 0);
+
+      for (const method of ['GET', 'POST']) {
+        const url = `http://localhost${path}${method === 'GET' ? '?name=&episode=1' : ''}`;
+        const result = await callWorker(url, {
+          method,
+          env,
+          ...(method === 'POST' ? {
+            headers: { 'content-type': 'application/x-www-form-urlencoded' },
+            body: 'name=&episode=1',
+          } : {}),
+        });
+        assert.strictEqual(result.status, 200);
+        assert.deepStrictEqual(result.json, []);
+        const expectedCount = method === 'GET' ? 1 : 2;
+        assert.strictEqual(Globals.reqRecords.length, expectedCount, `${method} ${path} 应恰好记录一次请求`);
+        assert.strictEqual(Globals.todayReqNum, expectedCount, `${method} ${path} 应增加今日请求数`);
+        assert.strictEqual(Globals.reqRecords.at(-1).method, method);
+        assert.strictEqual(Globals.reqRecords.at(-1).interface, url);
+      }
+    }
+  } finally {
+    Globals.reqRecords = previousRecords;
+    Globals.todayReqNum = previousTodayReqNum;
+  }
+});
+
 test('worker 默认 TOKEN：未知首段视为错误 token 返回 401，已知 API 首段放行', async () => {
   const unknown = await callWorker('http://localhost/not-a-known-path/x');
   assert.strictEqual(unknown.status, 401, '未知首段应按错误 token 处理');
@@ -840,4 +990,88 @@ test('worker 平台适配层：netlifyHandler / vercelHandler 映射为标准响
   assert.strictEqual(captured.status, 204);
   assert.strictEqual(captured.headers['access-control-allow-origin'], '*');
   assert.strictEqual(captured.body, '');
+});
+
+// ============================================================================
+// 系统管理接口鉴权（#531）：默认 TOKEN 的免 token 兼容不适用于管理接口
+// ============================================================================
+
+const ADMIN_ONLY_PROBES = [
+  ['/api/env/set', 'POST'],
+  ['/api/env/add', 'POST'],
+  ['/api/env/del', 'POST'],
+  ['/api/deploy', 'POST'],
+  ['/api/cache/clear', 'POST'],
+  ['/api/cache/animes', 'GET'],
+  ['/api/logs/clear', 'POST'],
+  ['/api/cookie/status', 'GET'],
+  ['/api/cookie/save', 'POST'],
+  ['/api/cookie/verify', 'POST'],
+  ['/api/cookie/qr/generate', 'POST'],
+  ['/api/cookie/qr/check', 'POST'],
+  ['/api/ai/verify', 'POST'],
+  ['/api/nipaplay/verify', 'POST'],
+];
+
+test('worker 默认 TOKEN 下管理接口无 token 一律 401（默认 token 不是凭据）', async () => {
+  for (const [path, method] of ADMIN_ONLY_PROBES) {
+    const tokenless = await callWorker(`http://localhost${path}`, {
+      method, headers: { 'content-type': 'application/json' }, body: method === 'GET' ? undefined : '{}',
+    });
+    assert.strictEqual(tokenless.status, 401, `${path} 无 token 应被拦截`);
+    assert.strictEqual(tokenless.json.errorCode, 401);
+    assert.match(tokenless.json.errorMessage, /ADMIN_TOKEN/, `${path} 应提示需要 ADMIN_TOKEN`);
+    assert.strictEqual(tokenless.json.message, undefined, `${path} 不应进入处理器（处理器会返回业务 message）`);
+
+    // 显式携带公开的默认 token 同样不构成管理凭据
+    const withDefaultToken = await callWorker(`http://localhost/87654321${path}`, {
+      method, headers: { 'content-type': 'application/json' }, body: method === 'GET' ? undefined : '{}',
+    });
+    assert.strictEqual(withDefaultToken.status, 401, `${path} 携带默认 token 仍应被拦截`);
+  }
+});
+
+test('worker 配置 ADMIN_TOKEN 后管理接口放行，普通业务接口的免 token 兼容不受影响', async () => {
+  const env = { ADMIN_TOKEN: 'admin-tok' };
+
+  const clearCache = await callWorker('http://localhost/admin-tok/api/cache/clear', { method: 'POST', env });
+  assert.strictEqual(clearCache.status, 200);
+  assert.strictEqual(clearCache.json.success, true);
+
+  const clearLogs = await callWorker('http://localhost/admin-tok/api/logs/clear', { method: 'POST', env });
+  assert.strictEqual(clearLogs.status, 200);
+
+  // 通过闸门后落到处理器自身的参数校验（400），证明已放行而不是被鉴权拦下
+  const delEnv = await callWorker('http://localhost/admin-tok/api/env/del', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(delEnv.status, 400);
+  assert.strictEqual(delEnv.json.message, '缺少环境变量名称');
+
+  // 默认 TOKEN 下普通业务接口仍可无 token 访问
+  const reqRecords = await callWorker('http://localhost/api/reqrecords');
+  assert.strictEqual(reqRecords.status, 200);
+  const logs = await callWorker('http://localhost/api/logs');
+  assert.strictEqual(logs.status, 200, 'GET /api/logs 仍可非 admin 读取（内容脱敏）');
+});
+
+test('worker 自定义 TOKEN 下管理接口只接受 ADMIN_TOKEN', async () => {
+  const env = { TOKEN: 'user-token-1', ADMIN_TOKEN: 'admin-tok' };
+
+  const userToken = await callWorker('http://localhost/user-token-1/api/env/set', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(userToken.status, 401, '普通 token 不能访问管理接口');
+  assert.match(userToken.json.errorMessage, /ADMIN_TOKEN/);
+
+  const noToken = await callWorker('http://localhost/api/env/set', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(noToken.status, 401);
+
+  const adminToken = await callWorker('http://localhost/admin-tok/api/env/set', {
+    method: 'POST', env, headers: { 'content-type': 'application/json' }, body: '{}',
+  });
+  assert.strictEqual(adminToken.status, 400, 'ADMIN_TOKEN 应通过闸门并落到处理器参数校验');
+  assert.strictEqual(adminToken.json.message, '缺少环境变量名称');
 });
