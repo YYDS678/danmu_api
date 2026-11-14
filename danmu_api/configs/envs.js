@@ -725,9 +725,9 @@ export class Envs {
       'STRICT_TITLE_MATCH': { category: 'match', type: 'boolean', description: '严格标题匹配模式' },
       'TITLE_TO_CHINESE': { category: 'match', type: 'boolean', description: '外语标题转换中文开关' },
       'ANIME_TITLE_SIMPLIFIED': { category: 'match', type: 'boolean', description: '搜索的剧名标题自动繁转简' },
-      'TITLE_MAPPING_TABLE': { category: 'match', type: 'map', description: '本机剧名映射表，用于自动匹配时替换标题进行搜索。本机规则优先于远程规则。格式：原始标题->映射标题;原始标题->映射标题;...，例如："唐朝诡事录->唐朝诡事录之西行;国色芳华->锦绣芳华"' },
+      'TITLE_MAPPING_TABLE': { category: 'match', type: 'map', description: '本机剧名映射表，用于自动匹配、FongMi、收藏时替换标题进行搜索。精确标题优先；未命中时会忽略标题尾部括号年份再匹配（如“变形金刚3：月黑之时(2011)”可命中“变形金刚3：月黑之时”）。本机规则优先于远程规则。格式：原始标题->映射标题;原始标题->映射标题;...，例如："唐朝诡事录->唐朝诡事录之西行;国色芳华->锦绣芳华"' },
       'TITLE_MAPPING_TABLE_URL': { category: 'match', type: 'text', description: '远程剧名映射表（默认关闭，填写后启用）。示例：https://raw.githubusercontent.com/xlmc/danmu-mapping/main/Word/2026.txt。本机 TITLE_MAPPING_TABLE 优先；Node/Docker 会缓存到 .cache 并在每天北京时间05:30后台更新；Serverless 冷启动后的首次标题匹配会同步下载，最长约等待5秒，配置本变量即表示接受该延迟。支持 GitHub 文件页、Gist、jsDelivr 和 HTTP/HTTPS TXT 直链；内容格式为每行 原始标题->映射标题，# 或 // 开头为注释' },
-      'AUTO_MATCH_MAPPING_TABLE': { category: 'match', type: 'map', description: '自动匹配映射表，仅作用于 POST /api/v2/match。多个规则使用分号分隔。\n开放映射：永生 S05E02 -> 永生 S01E58\n有限范围：永生 S05E02~03 -> 永生 S01E58~59\n指定结果：海贼王 S02E01 -> 航海王(1999)【动漫】 S01E62\n指定平台：航海王 S01E01 -> 航海王 S01E01 @qiyi' },
+      'AUTO_MATCH_MAPPING_TABLE': { category: 'match', type: 'map', description: '自动匹配映射表，仅作用于 POST /api/v2/match。多个规则使用分号分隔。\n开放映射：永生 S05E02 -> 永生 S01E58\n有限范围：永生 S05E02~03 -> 永生 S01E58~59\n特别篇：灵笼 S00E01~01 -> 灵笼 S01E07~07（源侧支持 S00，目标侧须为 S01+）\n指定结果：海贼王 S02E01 -> 航海王(1999)【动漫】 S01E62\n指定平台：航海王 S01E01 -> 航海王 S01E01 @qiyi' },
       'AUTO_MATCH_MAPPING_TABLE_URL': { category: 'match', type: 'text', description: '远程季集映射表（默认关闭，填写后启用）。本机 AUTO_MATCH_MAPPING_TABLE 优先；支持 GitHub 文件页、Gist、jsDelivr 和 HTTP/HTTPS TXT 直链，内容格式与本机映射表一致，每行可写多条规则，# 或 // 开头为注释。Node/Docker 会缓存到 .cache 并在每天北京时间05:30后台更新；Serverless 首次匹配会后台下载，不阻塞当前请求，后续请求生效。管理员可通过 POST /api/auto-match-mapping/refresh 立即刷新当前实例。' },
       'TITLE_NOISE_FILTER': { category: 'match', type: 'text', description: '剧名杂音清理规则，按正则表达式清理搜索与匹配阶段的剧名杂音词（如`百花杀（真彩）`→`百花杀`）。\n默认值：[（(\\[［](?:臻彩|真彩|高清|标清|超清|国配|中配|日配|粤语|原声|台配|无修|未删减|完整版|日语版|国语版|英语版|中字|字幕|助听|原版)[\\])）］]，中英文圆方括号均匹配。\n设为空值可禁用' },
       'AI_BASE_URL': { category: 'match', type: 'text', description: 'AI服务基础URL，不填默认为https://api.openai.com/v1' },
@@ -738,7 +738,7 @@ export class Envs {
 
       // 弹幕配置
       'BLOCKED_WORDS': { category: 'danmu', type: 'text', description: '屏蔽词列表' },
-      'GROUP_MINUTE': { category: 'danmu', type: 'number', description: '分钟内合并去重（0表示不去重），默认1', min: 0, max: 30 },
+      'GROUP_MINUTE': { category: 'danmu', type: 'number', description: '分钟内合并去重（0 表示不按分钟合并，多源组合仍按时点去重），默认1', min: 0, max: 30 },
       'DANMU_LIMIT': { category: 'danmu', type: 'number', description: '弹幕数量限制，单位为k，即千：默认 0，表示不限制弹幕数', min: 0, max: 100 },
       'DANMU_SIMPLIFIED_TRADITIONAL': { category: 'danmu', type: 'select', options: ['default', 'simplified', 'traditional'], description: '弹幕简繁体转换设置：default（默认不转换）、simplified（繁转简）、traditional（简转繁）' },
       'CONVERT_TOP_BOTTOM_TO_SCROLL': { category: 'danmu', type: 'boolean', description: '顶部/底部弹幕转换为浮动弹幕' },
@@ -804,7 +804,7 @@ export class Envs {
       episodeTitleFilter: this.resolveEpisodeTitleFilter(), // 剧集标题正则过滤
       titleNoiseFilter: this.resolveTitleNoiseFilter(), // 剧名杂音清理规则
       blockedWords: this.get('BLOCKED_WORDS', '', 'string'), // 屏蔽词列表
-      groupMinute: Math.min(this.get('GROUP_MINUTE', 1, 'number'), 30), // 分钟内合并去重（默认 1，最大值30，0表示不去重）
+      groupMinute: Math.min(this.get('GROUP_MINUTE', 1, 'number'), 30), // 分钟内合并去重（默认 1，最大值30，0 表示不按分钟合并，多源仍按时点去重）
       danmuLimit: this.get('DANMU_LIMIT', 0, 'number'), // 等间隔采样限制弹幕总数，单位为k，即千：默认 0，表示不限制弹幕数，若改为5，弹幕总数在超过5000的情况下会将弹幕数控制在5000
       uiTheme: this.get('UI_THEME', 'lavender', 'string').toLowerCase(), // 管理界面主题
       proxyUrl: this.get('PROXY_URL', '', 'string', true), // 代理/反代地址
